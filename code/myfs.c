@@ -4,15 +4,70 @@
 #include <fuse.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <time.h>
 
 #include "myfs.h"
 
 unqlite* pDb;
 
+FileControlBlock root_directory;
 
-void init_fs() {
+DirectoryEntry emptyDirectory[MAX_DIRECTORY_ENTRIES];
+
+static void setTimespecToNow(struct timespec* tm) {
+    struct timespec now;
+    timespec_get(&now, TIME_UTC);
+
+    memcpy(tm, &now, sizeof(now));
+}
+
+static void createDirectoryNode(FileControlBlock* blockToFill) {
+    blockToFill->st_mode = DEFAULT_DIR_MODE;
+
+    setTimespecToNow(&blockToFill->st_ctim);
+    setTimespecToNow(&blockToFill->st_atim);
+    setTimespecToNow(&blockToFill->st_mtim);
+
+    struct fuse_context* ctx = fuse_get_context();
+
+    blockToFill->user_id = ctx->uid;
+    blockToFill->group_id = ctx->gid;
+
+    uuid_t directoryDataBlockUUID;
+    uuid_generate(directoryDataBlockUUID);
+
+    int rc = unqlite_kv_store(pDb, directoryDataBlockUUID, KEY_SIZE, emptyDirectory, sizeof emptyDirectory);
+    error_handler(rc);
+
+    blockToFill->size = sizeof(emptyDirectory);
+
+    memcpy(&blockToFill->data_ref, &directoryDataBlockUUID, sizeof directoryDataBlockUUID);
+}
+
+static void init_fs() {
     int rc = unqlite_open(&pDb,DATABASE_NAME,UNQLITE_OPEN_CREATE);
-	if( rc != UNQLITE_OK ) error_handler(rc);
+    if( rc != UNQLITE_OK ) error_handler(rc);
+    
+    unqlite_int64 bytesRead;
+
+    rc = unqlite_kv_fetch(pDb, ROOT_OBJECT_KEY, ROOT_OBJECT_KEY_SIZE, &root_directory, &bytesRead);
+
+    if(rc == UNQLITE_NOTFOUND) {
+        perror("Root of filesystem not found. Creating it...\n");
+
+        createDirectoryNode(&root_directory);
+
+        unqlite_kv_store(pDb, ROOT_OBJECT_KEY, ROOT_OBJECT_KEY_SIZE, &root_directory, sizeof root_directory);
+    }
+    else {
+        perror("Root of filesystem found. Using it as the root folder...\n");
+        error_handler(rc);
+
+        if(bytesRead != sizeof root_directory) {
+            perror("!!! Database is corrupted, exiting...\n");
+            exit(-1);
+        }
+    }
 }
 
 // The functions which follow are handler functions for various things a filesystem needs to do:
@@ -22,9 +77,21 @@ void init_fs() {
 // Get file and directory attributes (meta-data).
 // Read 'man 2 stat' and 'man 2 chmod'.
 static int myfs_getattr(const char *path, struct stat *stbuf) {
-
     write_log("myfs_getattr(path=\"%s\")\n", path);
+
+    if(strcmp(path,"/") == 0) {
+        stbuf->st_mode = DEFAULT_DIR_MODE;	/* File mode.  */
+        stbuf->st_nlink = 2;	/* Link count.  */
+        stbuf->st_uid = root_directory.user_id;		/* User ID of the file's owner.  */
+        stbuf->st_gid = root_directory.group_id;		/* Group ID of the file's group. */
+        stbuf->st_size = root_directory.size;	/* Size of file, in bytes.  */
+        stbuf->st_atime = root_directory.st_atim.tv_sec;	/* Time of last access.  */
+        stbuf->st_mtime = root_directory.st_mtim.tv_sec;	/* Time of last modification.  */
+        stbuf->st_ctime = root_directory.st_ctim.tv_sec;	/* Time of last status change.  */
+        return 0;
+    }
     
+    write_log("myfs_getattr(path=\"%s\"): Path not found\n", path);    
     return -ENOENT;
 }
 
