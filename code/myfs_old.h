@@ -16,10 +16,42 @@
 const mode_t DEFAULT_FILE_MODE = S_IFREG|S_IRUSR|S_IWUSR|S_IRGRP|S_IWGRP|S_IROTH;
 const mode_t DEFAULT_DIR_MODE = S_IFDIR|S_IRUSR|S_IWUSR|S_IXUSR|S_IRGRP|S_IWGRP|S_IXGRP|S_IROTH|S_IXOTH;
 
+// This is a starting File Control Block for the 
+// simplistic implementation provided.
+//
+// It combines the information for the root directory "/"
+// and one single file inside this directory. This is why there
+// is a one file limit for this filesystem
+//
+// Obviously, you will need to be change this into a
+// more sensible FCB to implement a proper filesystem
+
+typedef struct _myfcb {
+    char path[MAX_FILENAME_SIZE];
+    uuid_t file_data_id;
+    
+    // see 'man 2 stat' and 'man 2 chmod'
+    //meta-data for the 'file'
+    uid_t  uid;     /* user */
+    gid_t  gid;     /* group */
+    mode_t mode;    /* protection */
+    time_t mtime;   /* time of last modification */
+    time_t ctime;   /* time of last change to meta-data (status) */
+    off_t size;     /* size */
+    
+    //meta-data for the root thing (directory)
+    uid_t  root_uid;    /* user */
+    gid_t  root_gid;    /* group */
+    mode_t root_mode;   /* protection */
+    time_t root_mtime;  /* time of last modification */
+} myfcb;
+
+
 typedef struct _DirectoryEntry {
     char name[MAX_FILENAME_SIZE];
     uuid_t fcb_ref;
 } DirectoryEntry;
+
 
 typedef struct _FileControlBlock {
     uuid_t data_ref;
@@ -37,6 +69,10 @@ typedef struct _FileControlBlock {
     struct timespec st_ctim;  /* Time of last status change */
 
 } FileControlBlock;
+
+// Some other useful definitions we might need
+
+extern unqlite_int64 root_object_size_value;
 
 // We need to use a well-known value as a key for the root object.
 #define ROOT_OBJECT_KEY "root"
@@ -121,3 +157,4 @@ void print_id(uuid_t *id){
         printf("%02x ", (*id)[i]);
     }
 }
+
