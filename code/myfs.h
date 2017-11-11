@@ -14,7 +14,7 @@
 #define MAX_DIRECTORY_ENTRIES 100
 
 const mode_t DEFAULT_FILE_MODE = S_IFREG|S_IRUSR|S_IWUSR|S_IRGRP|S_IWGRP|S_IROTH;
-const mode_t DEFAULT_DIR_MODE = S_IFDIR|S_IRUSR|S_IWUSR|S_IXUSR|S_IRGRP|S_IWGRP|S_IXGRP|S_IROTH|S_IXOTH;
+const mode_t DEFAULT_DIR_MODE = S_IFDIR|S_IRUSR|S_IWUSR|S_IXUSR|S_IRGRP|S_IXGRP|S_IROTH|S_IXOTH;
 
 typedef struct _DirectoryEntry {
     char name[MAX_FILENAME_SIZE];
@@ -22,20 +22,19 @@ typedef struct _DirectoryEntry {
 } DirectoryEntry;
 
 typedef struct _FileControlBlock {
-    uuid_t data_ref;
+    uuid_t          data_ref;
 
-    mode_t    st_mode;        /* File type and mode */
+    mode_t          mode;        /* File type and mode */
     // nlink_t   st_nlink;       /* Number of hard links */ // Maybe implement?
-    uid_t     user_id;         /* User ID of owner */
-    gid_t     group_id;         /* Group ID of owner */
-    off_t     size;        /* Total size, in bytes */
+    uid_t           user_id;         /* User ID of owner */
+    gid_t           group_id;         /* Group ID of owner */
+    off_t           size;        /* Total size, in bytes */
     // blksize_t st_blksize;     /* Block size for filesystem I/O */ // TODO: Maybe make blocks a thing?
     // blkcnt_t  st_blocks;      /* Number of 512B blocks allocated */
 
     struct timespec st_atim;  /* Time of last access */
     struct timespec st_mtim;  /* Time of last modification */
     struct timespec st_ctim;  /* Time of last status change */
-
 } FileControlBlock;
 
 // We need to use a well-known value as a key for the root object.
