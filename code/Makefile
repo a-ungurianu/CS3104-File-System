@@ -18,3 +18,6 @@ $(TARGET1): $(TARGET1).o $(OBJ)
 
 clean:
 	rm -f *.o *~ core myfs.db myfs.log $(TARGET1)
+
+unmount:
+	fusermount -u test
