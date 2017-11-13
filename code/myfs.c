@@ -13,7 +13,7 @@ unqlite* pDb;
 
 FileControlBlock root_directory;
 
-DirectoryEntry emptyDirectory[MAX_DIRECTORY_ENTRIES];
+DirectoryDataBlock emptyDirectory;
 
 static void setTimespecToNow(struct timespec* tm) {
     struct timespec now;
@@ -35,7 +35,7 @@ static void createDirectoryNode(FileControlBlock* blockToFill) {
     uuid_t directoryDataBlockUUID;
     uuid_generate(directoryDataBlockUUID);
 
-    int rc = unqlite_kv_store(pDb, directoryDataBlockUUID, KEY_SIZE, emptyDirectory, sizeof emptyDirectory);
+    int rc = unqlite_kv_store(pDb, directoryDataBlockUUID, KEY_SIZE, &emptyDirectory, sizeof emptyDirectory);
     error_handler(rc);
 
     blockToFill->size = sizeof(emptyDirectory);
@@ -45,9 +45,9 @@ static void createDirectoryNode(FileControlBlock* blockToFill) {
 
 static int addFCBToDirectory(FileControlBlock* dirBlock, const char* name, uuid_t fcb_ref) {
     if(dirBlock->mode & S_IFDIR) {
-        DirectoryEntry entries[MAX_DIRECTORY_ENTRIES];
+        DirectoryDataBlock entries;
         unqlite_int64 bytesRead = sizeof entries;
-        int rc = unqlite_kv_fetch(pDb, dirBlock->data_ref, KEY_SIZE, entries, &bytesRead);
+        int rc = unqlite_kv_fetch(pDb, dirBlock->data_ref, KEY_SIZE, &entries, &bytesRead);
 
         error_handler(rc);
 
@@ -56,23 +56,29 @@ static int addFCBToDirectory(FileControlBlock* dirBlock, const char* name, uuid_
             exit(-1);
         }
 
+        if(entries.usedEntries == MAX_DIRECTORY_ENTRIES) {
+            return -ENOSPC;
+        }
+
         for(int i = 0; i < MAX_DIRECTORY_ENTRIES; ++i) {
-            if(strcmp(entries[i].name,name) == 0) {
+            if(strcmp(entries.entries[i].name,name) == 0) {
                 return -EEXIST;
             }
         }
 
         for(int i = 0; i < MAX_DIRECTORY_ENTRIES; ++i) {
-            if(strcmp(entries[i].name,"") == 0) {
-                strcpy(entries[i].name, name);
-                uuid_copy(entries[i].fcb_ref, fcb_ref);
+            if(strcmp(entries.entries[i].name,"") == 0) {
+                strcpy(entries.entries[i].name, name);
+                uuid_copy(entries.entries[i].fcb_ref, fcb_ref);
 
-                rc = unqlite_kv_store(pDb, dirBlock->data_ref, KEY_SIZE, entries, sizeof entries);
+                entries.usedEntries += 1;
+                rc = unqlite_kv_store(pDb, dirBlock->data_ref, KEY_SIZE, &entries, sizeof entries);
                 error_handler(rc);
                 return 0;
             }
         }
 
+        write_log("Directory size says it has room, but it doesn't...");
         return -ENOSPC;
     }
 
@@ -81,9 +87,9 @@ static int addFCBToDirectory(FileControlBlock* dirBlock, const char* name, uuid_
 
 static int getFCBInDirectory(const FileControlBlock* dirBlock, const char* name, FileControlBlock* toFill) {
     if(dirBlock->mode & S_IFDIR) {
-        DirectoryEntry entries[MAX_DIRECTORY_ENTRIES];
+        DirectoryDataBlock entries;
         unqlite_int64 bytesRead = sizeof entries;
-        int rc = unqlite_kv_fetch(pDb, dirBlock->data_ref, KEY_SIZE, entries, &bytesRead);
+        int rc = unqlite_kv_fetch(pDb, dirBlock->data_ref, KEY_SIZE, &entries, &bytesRead);
 
         error_handler(rc);
 
@@ -92,10 +98,14 @@ static int getFCBInDirectory(const FileControlBlock* dirBlock, const char* name,
             exit(-1);
         }
 
+        if(entries.usedEntries == 0) {
+            return -ENOENT;
+        }
+
         for(int i = 0; i < MAX_DIRECTORY_ENTRIES; ++i) {
-            if(strcmp(entries[i].name, name) == 0) {
+            if(strcmp(entries.entries[i].name, name) == 0) {
                 bytesRead = sizeof(FileControlBlock);
-                rc = unqlite_kv_fetch(pDb, entries[i].fcb_ref, KEY_SIZE, toFill, &bytesRead);
+                rc = unqlite_kv_fetch(pDb, entries.entries[i].fcb_ref, KEY_SIZE, toFill, &bytesRead);
 
                 error_handler(rc);
                 
@@ -149,35 +159,21 @@ static void init_fs() {
 static int myfs_getattr(const char *path, struct stat *stbuf) {
     write_log("myfs_getattr(path=\"%s\")\n", path);
 
-    char* pathCopy = strdup(path);
-    
-    char* savePtr;
 
-    char* p = strtok_r(pathCopy,"/",&savePtr);
+    FileControlBlock currentDirectory;
 
-    FileControlBlock currentDir = root_directory;
+    int rc = getFCBAtPath(path, &currentDirectory);
 
-    write_log("\tPath: [");
-    while(p != NULL) {
-        write_log("%s,",p);
+    if(rc != 0) return rc;
 
-        int rc = getFCBInDirectory(&currentDir,p,&currentDir);
-        if(rc != 0) return rc;
-
-        p = strtok_r(NULL, "/",&savePtr);
-    }
-    write_log("\b]\n");
-
-    free(pathCopy);
-
-    stbuf->st_mode  = currentDir.mode;	               /* File mode.  */
-    stbuf->st_nlink = 2;	                            /* Link count.  */
-    stbuf->st_uid   = currentDir.user_id;		    /* User ID of the file's owner.  */
-    stbuf->st_gid   = currentDir.group_id;		    /* Group ID of the file's group. */
-    stbuf->st_size  = currentDir.size;	            /* Size of file, in bytes.  */
-    stbuf->st_atime = currentDir.st_atim.tv_sec;	/* Time of last access.  */
-    stbuf->st_mtime = currentDir.st_mtim.tv_sec;	/* Time of last modification.  */
-    stbuf->st_ctime = currentDir.st_ctim.tv_sec;	/* Time of last status change.  */
+    stbuf->st_mode  = currentDirectory.mode;            /* File mode.  */
+    stbuf->st_nlink = 2;                                /* Link count.  */
+    stbuf->st_uid   = currentDirectory.user_id;		    /* User ID of the file's owner.  */
+    stbuf->st_gid   = currentDirectory.group_id;        /* Group ID of the file's group. */
+    stbuf->st_size  = currentDirectory.size;            /* Size of file, in bytes.  */
+    stbuf->st_atime = currentDirectory.st_atim.tv_sec;	/* Time of last access.  */
+    stbuf->st_mtime = currentDirectory.st_mtim.tv_sec;	/* Time of last modification.  */
+    stbuf->st_ctime = currentDirectory.st_ctim.tv_sec;	/* Time of last status change.  */
 
     return 0;
 }
@@ -187,42 +183,24 @@ static int myfs_getattr(const char *path, struct stat *stbuf) {
 static int myfs_readdir(const char *path, void *buf, fuse_fill_dir_t filler, off_t offset, struct fuse_file_info *fi) {
     write_log("myfs_readdir(path=\"%s\")\n", path);
 
-    FileControlBlock currentDirectory = root_directory;
+    FileControlBlock currentDirectory;
 
-    char* pathCopy = strdup(path);
-    
-    char* savePtr;
-    
-    char* p = strtok_r(pathCopy,"/", &savePtr);
-
-    FileControlBlock currentDir = root_directory;
-
-    write_log("\tPath: [");
-    while(p != NULL) {
-        write_log("%s,",p);
-
-        int rc = getFCBInDirectory(&currentDirectory,p,&currentDirectory);
-        if(rc != 0) return rc;
-
-        p = strtok_r(NULL, "/", &savePtr);
-    }
-    write_log("\b]\n");
-
-    free(pathCopy);
+    int rc = getFCBAtPath(path, &currentDirectory);
+    if(rc != 0) return rc;
 
     filler(buf, ".", NULL, 0);
     filler(buf, "..", NULL, 0);
 
-    DirectoryEntry entries[MAX_DIRECTORY_ENTRIES];
+    DirectoryDataBlock entries;
 
     unqlite_int64 bytesRead = sizeof entries;
-    int rc = unqlite_kv_fetch(pDb, currentDirectory.data_ref, KEY_SIZE, entries, &bytesRead);
+    rc = unqlite_kv_fetch(pDb, currentDirectory.data_ref, KEY_SIZE, &entries, &bytesRead);
 
     error_handler(rc);
 
     for(int i = 0; i < MAX_DIRECTORY_ENTRIES; ++i) {
-        if(strcmp(entries[i].name,"") != 0) {
-            filler(buf, entries[i].name, NULL, 0);
+        if(strcmp(entries.entries[i].name,"") != 0) {
+            filler(buf, entries.entries[i].name, NULL, 0);
         }
     }
     
@@ -290,26 +268,21 @@ int myfs_chown(const char *path, uid_t uid, gid_t gid){
 int myfs_mkdir(const char *path, mode_t mode){
     write_log("myfs_mkdir(path=\"%s\", mode=0%03o)\n", path, mode);	
     
-    char* pathCopy = strdup(path);
-    char* pathCopy2 = strdup(path);
+    char* basenameCopy = strdup(path);
+    char* dirnameCopy = strdup(path);
 
-    char* name = basename(pathCopy);
-    char* pathToDir = dirname(pathCopy2);
-    char* p = strtok(pathToDir,"/");
+    char* name = basename(basenameCopy);
+    char* pathToDir = dirname(dirnameCopy);
+    
+    FileControlBlock currentDir;
 
-    FileControlBlock currentDir = root_directory;
+    int rc = getFCBAtPath(pathToDir, &currentDir);
 
-    write_log("\tPath: [");
-    while(p != NULL) {
-        write_log("%s,",p);
-        int rc = getFCBInDirectory(&currentDir, p, &currentDir);
-
-        if(rc != 0) return rc;
-
-        p = strtok(NULL, "/");
+    if(rc != 0){ 
+        free(basenameCopy);
+        free(dirnameCopy);
+        return rc;
     }
-    write_log("\b]\n");
-
 
     FileControlBlock newDirectory;
     createDirectoryNode(&newDirectory);
@@ -318,14 +291,14 @@ int myfs_mkdir(const char *path, mode_t mode){
 
     uuid_generate(newDirectoryRef);
 
-    int rc = unqlite_kv_store(pDb,newDirectoryRef, KEY_SIZE, &newDirectory, sizeof newDirectory);
+    rc = unqlite_kv_store(pDb,newDirectoryRef, KEY_SIZE, &newDirectory, sizeof newDirectory);
 
     error_handler(rc);
 
     rc = addFCBToDirectory(&currentDir,name,newDirectoryRef);
 
-    free(pathCopy);
-    free(pathCopy2);
+    free(basenameCopy);
+    free(dirnameCopy);
     return rc;
 }
 
@@ -413,3 +386,29 @@ int main(int argc, char *argv[]){
 	return fuserc;
 }
 
+static int getFCBAtPath(const char* path, FileControlBlock* toFill) {
+    char* pathCopy = strdup(path);
+    
+    char* savePtr;
+
+    char* p = strtok_r(pathCopy,"/",&savePtr);
+
+    FileControlBlock currentDir = root_directory;
+
+    write_log("\tPath: [");
+    while(p != NULL) {
+        write_log("%s,",p);
+
+        int rc = getFCBInDirectory(&currentDir,p,&currentDir);
+        if(rc != 0) return rc;
+
+        p = strtok_r(NULL, "/",&savePtr);
+    }
+    write_log("\b]\n");
+
+    free(pathCopy);
+
+    memcpy(toFill, &currentDir, sizeof currentDir);
+
+    return 0;
+}

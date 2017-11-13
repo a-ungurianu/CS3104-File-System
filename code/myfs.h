@@ -21,6 +21,11 @@ typedef struct _DirectoryEntry {
     uuid_t fcb_ref;
 } DirectoryEntry;
 
+typedef struct _DirectoryDataBlock {
+    int usedEntries;
+    DirectoryEntry entries[MAX_DIRECTORY_ENTRIES];
+} DirectoryDataBlock;
+
 typedef struct _FileControlBlock {
     uuid_t          data_ref;
 
