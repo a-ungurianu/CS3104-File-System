@@ -122,6 +122,99 @@ static int getFCBInDirectory(const FileControlBlock* dirBlock, const char* name,
     return -ENOTDIR;
 }
 
+static int getFCBAtPath(const char* path, FileControlBlock* toFill) {
+    char* pathCopy = strdup(path);
+    
+    char* savePtr;
+
+    char* p = strtok_r(pathCopy,"/",&savePtr);
+
+    FileControlBlock currentDir = root_directory;
+
+    write_log("\tPath: [");
+    while(p != NULL) {
+        write_log("%s,",p);
+
+        int rc = getFCBInDirectory(&currentDir,p,&currentDir);
+        if(rc != 0) return rc;
+
+        p = strtok_r(NULL, "/",&savePtr);
+    }
+    write_log("\b]\n");
+
+    free(pathCopy);
+
+    memcpy(toFill, &currentDir, sizeof currentDir);
+
+    return 0;
+}
+
+static int removeFCBInDirectory(const FileControlBlock* dirBlock, const char* name) {
+    if(dirBlock->mode & S_IFDIR) {
+        DirectoryDataBlock entries;
+        unqlite_int64 bytesRead = sizeof entries;
+
+        int rc = unqlite_kv_fetch(pDb, dirBlock->data_ref, KEY_SIZE, &entries, &bytesRead);
+        error_handler(rc);
+
+        if(bytesRead != sizeof entries) {
+            write_log("Directory data block is corrupted. Exiting...\n");
+            exit(-1);
+        }
+
+        if(entries.usedEntries == 0) return -ENOENT;
+
+        for(int i = 0; i < MAX_DIRECTORY_ENTRIES; ++i) {
+            if(strcmp(entries.entries[i].name, name) == 0) {
+                uuid_t fcb_uuid;
+                FileControlBlock fcb;
+                memcpy(&fcb_uuid, entries.entries[i].fcb_ref, sizeof(uuid_t));
+
+                bytesRead = sizeof(fcb);
+
+                rc = unqlite_kv_fetch(pDb, fcb_uuid, KEY_SIZE, &fcb, &bytesRead);
+                error_handler(rc);
+                
+                if(fcb.mode & S_IFDIR) {
+                    
+                    DirectoryDataBlock childEntries;
+
+                    bytesRead = sizeof(childEntries);
+                    int rc = unqlite_kv_fetch(pDb, fcb.data_ref, KEY_SIZE, &childEntries, &bytesRead);
+                    error_handler(rc);
+
+                    if(bytesRead != sizeof childEntries) {
+                        write_log("Directory data block is corrupted. Exiting...\n");
+                        exit(-1);
+                    }
+
+                    if(childEntries.usedEntries != 0) {
+                        return -ENOTEMPTY;
+                    }
+
+                    unqlite_kv_delete(pDb, fcb.data_ref, KEY_SIZE);
+                    unqlite_kv_delete(pDb, fcb_uuid,     KEY_SIZE);
+
+                    memset(&entries.entries[i], 0, sizeof(entries.entries[i]));
+
+                    entries.usedEntries -= 1;
+                    rc = unqlite_kv_store(pDb, dirBlock->data_ref, KEY_SIZE, &entries, sizeof entries);
+                    error_handler(rc);
+                    
+                    return 0;
+                }
+                else {
+                    return -ENOTDIR;
+                }
+
+            }
+        }
+
+        return -ENOENT;
+    }
+    return -ENOTDIR;
+}
+
 static void init_fs() {
     int rc = unqlite_open(&pDb,DATABASE_NAME,UNQLITE_OPEN_CREATE);
     if( rc != UNQLITE_OK ) error_handler(rc);
@@ -315,7 +408,27 @@ int myfs_unlink(const char *path){
 int myfs_rmdir(const char *path){
     write_log("myfs_rmdir(path=\"%s\")\n",path);	
     
-    return 0;
+    char* pathCopy = strdup(path);
+    char* pathCopy2 = strdup(path);
+
+    char* name = basename(pathCopy);
+    char* pathToDir = dirname(pathCopy2);
+
+    FileControlBlock parentDir;
+
+    int rc = getFCBAtPath(pathToDir, &parentDir);
+
+    if(rc != 0) {
+        free(pathCopy);
+        free(pathCopy2);
+        return rc;
+    }
+
+    rc = removeFCBInDirectory(&parentDir,name);
+
+    free(pathCopy);
+    free(pathCopy2);
+    return rc;
 }
 
 // OPTIONAL - included as an example
@@ -350,6 +463,7 @@ static struct fuse_operations myfs_oper = {
     .getattr	= myfs_getattr,
     .readdir	= myfs_readdir,
     .mkdir      = myfs_mkdir,
+    .rmdir      = myfs_rmdir,
     .open		= myfs_open,
     .read		= myfs_read,
     .create		= myfs_create,
@@ -386,29 +500,3 @@ int main(int argc, char *argv[]){
 	return fuserc;
 }
 
-static int getFCBAtPath(const char* path, FileControlBlock* toFill) {
-    char* pathCopy = strdup(path);
-    
-    char* savePtr;
-
-    char* p = strtok_r(pathCopy,"/",&savePtr);
-
-    FileControlBlock currentDir = root_directory;
-
-    write_log("\tPath: [");
-    while(p != NULL) {
-        write_log("%s,",p);
-
-        int rc = getFCBInDirectory(&currentDir,p,&currentDir);
-        if(rc != 0) return rc;
-
-        p = strtok_r(NULL, "/",&savePtr);
-    }
-    write_log("\b]\n");
-
-    free(pathCopy);
-
-    memcpy(toFill, &currentDir, sizeof currentDir);
-
-    return 0;
-}
