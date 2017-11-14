@@ -4,3 +4,4 @@ myfs.log
 myfs.db
 myfs.db_unqlite_journal
 cmake-build-debug/
+.idea/workspace.xml
