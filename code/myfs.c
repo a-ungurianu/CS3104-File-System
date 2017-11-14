@@ -22,8 +22,8 @@ static void setTimespecToNow(struct timespec* tm) {
     memcpy(tm, &now, sizeof(now));
 }
 
-static void createDirectoryNode(FileControlBlock* blockToFill) {
-    blockToFill->mode = DEFAULT_DIR_MODE;
+static void createDirectoryNode(FileControlBlock* blockToFill, mode_t mode) {
+    blockToFill->mode = S_IFDIR | mode;
 
     setTimespecToNow(&blockToFill->st_ctim);
     setTimespecToNow(&blockToFill->st_atim);
@@ -32,7 +32,7 @@ static void createDirectoryNode(FileControlBlock* blockToFill) {
     blockToFill->user_id = getuid();
     blockToFill->group_id = getgid();
 
-    uuid_t directoryDataBlockUUID;
+    uuid_t directoryDataBlockUUID = {0};
     uuid_generate(directoryDataBlockUUID);
 
     int rc = unqlite_kv_store(pDb, directoryDataBlockUUID, KEY_SIZE, &emptyDirectory, sizeof emptyDirectory);
@@ -131,16 +131,13 @@ static int getFCBAtPath(const char* path, FileControlBlock* toFill) {
 
     FileControlBlock currentDir = root_directory;
 
-    write_log("\tPath: [");
     while(p != NULL) {
-        write_log("%s,",p);
 
         int rc = getFCBInDirectory(&currentDir,p,&currentDir);
         if(rc != 0) return rc;
 
         p = strtok_r(NULL, "/",&savePtr);
     }
-    write_log("\b]\n");
 
     free(pathCopy);
 
@@ -180,7 +177,7 @@ static int removeFCBInDirectory(const FileControlBlock* dirBlock, const char* na
                     DirectoryDataBlock childEntries;
 
                     bytesRead = sizeof(childEntries);
-                    int rc = unqlite_kv_fetch(pDb, fcb.data_ref, KEY_SIZE, &childEntries, &bytesRead);
+                    rc = unqlite_kv_fetch(pDb, fcb.data_ref, KEY_SIZE, &childEntries, &bytesRead);
                     error_handler(rc);
 
                     if(bytesRead != sizeof childEntries) {
@@ -226,7 +223,7 @@ static void init_fs() {
     if(rc == UNQLITE_NOTFOUND) {
         perror("Root of filesystem not found. Creating it...\n");
 
-        createDirectoryNode(&root_directory);
+        createDirectoryNode(&root_directory, DEFAULT_DIR_MODE);
 
         rc = unqlite_kv_store(pDb, ROOT_OBJECT_KEY, ROOT_OBJECT_KEY_SIZE, &root_directory, sizeof root_directory);
 
@@ -251,7 +248,6 @@ static void init_fs() {
 // Read 'man 2 stat' and 'man 2 chmod'.
 static int myfs_getattr(const char *path, struct stat *stbuf) {
     write_log("myfs_getattr(path=\"%s\")\n", path);
-
 
     FileControlBlock currentDirectory;
 
@@ -378,9 +374,9 @@ int myfs_mkdir(const char *path, mode_t mode){
     }
 
     FileControlBlock newDirectory;
-    createDirectoryNode(&newDirectory);
+    createDirectoryNode(&newDirectory, mode);
 
-    uuid_t newDirectoryRef;
+    uuid_t newDirectoryRef = {0};
 
     uuid_generate(newDirectoryRef);
 
