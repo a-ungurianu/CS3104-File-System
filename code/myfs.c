@@ -44,6 +44,8 @@ static void createDirectoryNode(FileControlBlock* blockToFill, mode_t mode) {
 }
 
 static int addFCBToDirectory(FileControlBlock* dirBlock, const char* name, uuid_t fcb_ref) {
+    if(strlen(name) >= MAX_FILENAME_SIZE) return -ENAMETOOLONG;
+
     if(dirBlock->mode & S_IFDIR) {
         DirectoryDataBlock entries;
         unqlite_int64 bytesRead = sizeof entries;
@@ -85,7 +87,9 @@ static int addFCBToDirectory(FileControlBlock* dirBlock, const char* name, uuid_
     return -ENOTDIR;
 }
 
-static int getFCBInDirectory(const FileControlBlock* dirBlock, const char* name, FileControlBlock* toFill) {
+static int getFCBInDirectory(const FileControlBlock* dirBlock, const char* name, FileControlBlock* toFill, uuid_t *uuidToFill) {
+    if(strlen(name) >= MAX_FILENAME_SIZE) return -ENAMETOOLONG;
+    
     if(dirBlock->mode & S_IFDIR) {
         DirectoryDataBlock entries;
         unqlite_int64 bytesRead = sizeof entries;
@@ -108,6 +112,10 @@ static int getFCBInDirectory(const FileControlBlock* dirBlock, const char* name,
                 rc = unqlite_kv_fetch(pDb, entries.entries[i].fcb_ref, KEY_SIZE, toFill, &bytesRead);
 
                 error_handler(rc);
+
+                if(uuidToFill != NULL) {
+                    uuid_copy(*uuidToFill,entries.entries[i].fcb_ref);
+                }
                 
                 if(bytesRead != sizeof(FileControlBlock)) {
                     write_log("FCB is corrupted. Exiting...\n");
@@ -122,7 +130,7 @@ static int getFCBInDirectory(const FileControlBlock* dirBlock, const char* name,
     return -ENOTDIR;
 }
 
-static int getFCBAtPath(const char* path, FileControlBlock* toFill) {
+static int getFCBAtPath(const char* path, FileControlBlock* toFill, uuid_t *uuidToFill) {
     char* pathCopy = strdup(path);
     
     char* savePtr;
@@ -133,7 +141,7 @@ static int getFCBAtPath(const char* path, FileControlBlock* toFill) {
 
     while(p != NULL) {
 
-        int rc = getFCBInDirectory(&currentDir,p,&currentDir);
+        int rc = getFCBInDirectory(&currentDir,p,&currentDir, uuidToFill);
         if(rc != 0) return rc;
 
         p = strtok_r(NULL, "/",&savePtr);
@@ -212,6 +220,7 @@ static int removeFCBInDirectory(const FileControlBlock* dirBlock, const char* na
     return -ENOTDIR;
 }
 
+
 static void init_fs() {
     int rc = unqlite_open(&pDb,DATABASE_NAME,UNQLITE_OPEN_CREATE);
     if( rc != UNQLITE_OK ) error_handler(rc);
@@ -251,7 +260,7 @@ static int myfs_getattr(const char *path, struct stat *stbuf) {
 
     FileControlBlock currentDirectory;
 
-    int rc = getFCBAtPath(path, &currentDirectory);
+    int rc = getFCBAtPath(path, &currentDirectory, NULL);
 
     if(rc != 0) return rc;
 
@@ -274,7 +283,7 @@ static int myfs_readdir(const char *path, void *buf, fuse_fill_dir_t filler, off
 
     FileControlBlock currentDirectory;
 
-    int rc = getFCBAtPath(path, &currentDirectory);
+    int rc = getFCBAtPath(path, &currentDirectory, NULL);
     if(rc != 0) return rc;
 
     filler(buf, ".", NULL, 0);
@@ -361,11 +370,18 @@ int myfs_mkdir(const char *path, mode_t mode){
     char* dirnameCopy = strdup(path);
 
     char* name = basename(basenameCopy);
+    
+    if(strlen(name) >= MAX_FILENAME_SIZE) {
+        free(basenameCopy);
+        free(dirnameCopy);
+        return -ENAMETOOLONG;
+    }
+    
     char* pathToDir = dirname(dirnameCopy);
     
     FileControlBlock currentDir;
 
-    int rc = getFCBAtPath(pathToDir, &currentDir);
+    int rc = getFCBAtPath(pathToDir, &currentDir, NULL);
 
     if(rc != 0){ 
         free(basenameCopy);
@@ -385,6 +401,9 @@ int myfs_mkdir(const char *path, mode_t mode){
     error_handler(rc);
 
     rc = addFCBToDirectory(&currentDir,name,newDirectoryRef);
+
+    // TODO: Add error handling for when the name is already used. Currently, the DB is populated with something that has no 
+    // reference.
 
     free(basenameCopy);
     free(dirnameCopy);
@@ -412,7 +431,7 @@ int myfs_rmdir(const char *path){
 
     FileControlBlock parentDir;
 
-    int rc = getFCBAtPath(pathToDir, &parentDir);
+    int rc = getFCBAtPath(pathToDir, &parentDir, NULL);
 
     if(rc != 0) {
         free(pathCopy);
