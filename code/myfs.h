@@ -12,6 +12,7 @@
 #define MAX_FILENAME_SIZE 256
 #define MY_MAX_FILE_SIZE 1000
 #define MAX_DIRECTORY_ENTRIES 100
+#define BLOCK_SIZE 1024
 
 const mode_t DEFAULT_FILE_MODE = S_IFREG|S_IRUSR|S_IWUSR|S_IRGRP|S_IWGRP|S_IROTH;
 const mode_t DEFAULT_DIR_MODE = S_IFDIR|S_IRUSR|S_IWUSR|S_IXUSR|S_IRGRP|S_IXGRP|S_IROTH|S_IXOTH;
@@ -25,6 +26,12 @@ typedef struct _DirectoryDataBlock {
     int usedEntries;
     DirectoryEntry entries[MAX_DIRECTORY_ENTRIES];
 } DirectoryDataBlock;
+
+typedef struct _FileDataBlock {
+    int size;
+    char data[BLOCK_SIZE];
+    uuid_t nextBlock;
+} FileDataBlock;
 
 typedef struct _FileControlBlock {
     uuid_t          data_ref;

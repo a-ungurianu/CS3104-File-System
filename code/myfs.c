@@ -11,9 +11,12 @@
 
 unqlite* pDb;
 
+uuid_t zero_uuid;
+
 FileControlBlock root_directory;
 
 DirectoryDataBlock emptyDirectory;
+FileDataBlock emptyFile;
 
 static void setTimespecToNow(struct timespec* tm) {
     struct timespec now;
@@ -41,6 +44,25 @@ static void createDirectoryNode(FileControlBlock* blockToFill, mode_t mode) {
     blockToFill->size = sizeof(emptyDirectory);
 
     memcpy(&blockToFill->data_ref, &directoryDataBlockUUID, sizeof directoryDataBlockUUID);
+}
+
+static void createFileNode(FileControlBlock* blockToFill, mode_t mode) {
+    blockToFill->mode = S_IFREG | mode;
+
+    setTimespecToNow(&blockToFill->st_ctim);
+    setTimespecToNow(&blockToFill->st_atim);
+    setTimespecToNow(&blockToFill->st_mtim);
+
+    blockToFill->user_id = getuid();
+    blockToFill->group_id = getgid();
+
+    uuid_t fileDataBlockUUID = {0};
+    uuid_generate(fileDataBlockUUID);
+
+    int rc = unqlite_kv_store(pDb, fileDataBlockUUID, KEY_SIZE, &emptyFile, sizeof emptyFile);
+    blockToFill->size = sizeof(emptyFile);
+
+    memcpy(&blockToFill->data_ref, &fileDataBlockUUID, sizeof fileDataBlockUUID);
 }
 
 static int addFCBToDirectory(FileControlBlock* dirBlock, const char* name, uuid_t fcb_ref) {
@@ -154,7 +176,79 @@ static int getFCBAtPath(const char* path, FileControlBlock* toFill, uuid_t *uuid
     return 0;
 }
 
-static int removeFCBInDirectory(const FileControlBlock* dirBlock, const char* name) {
+
+static void removeFileData(uuid_t headBlockUUID) {
+    if(uuid_compare(headBlockUUID, zero_uuid)) return;
+
+    FileDataBlock block;
+    unqlite_int64 nBytes = sizeof(block);
+    
+    int rc = unqlite_kv_fetch(pDb,headBlockUUID,KEY_SIZE,&block, &nBytes);
+
+    error_handler(rc);
+
+    removeFileData(block.nextBlock);
+
+    rc = unqlite_kv_delete(pDb,headBlockUUID,KEY_SIZE);
+
+    error_handler(rc);
+}
+
+static int removeFileFCBinDirectory(const FileControlBlock* dirBlock, const char* name) {
+    if(strlen(name) >= MAX_FILENAME_SIZE) return -ENAMETOOLONG;
+    
+    if(dirBlock->mode & S_IFDIR) {
+        DirectoryDataBlock entries;
+        unqlite_int64 bytesRead = sizeof entries;
+
+        int rc = unqlite_kv_fetch(pDb, dirBlock->data_ref, KEY_SIZE, &entries, &bytesRead);
+        error_handler(rc);
+
+        if(bytesRead != sizeof entries) {
+            write_log("Directory data block is corrupted. Exiting...\n");
+            exit(-1);
+        }
+
+        if(entries.usedEntries == 0) return -ENOENT;
+
+        for(int i = 0; i < MAX_DIRECTORY_ENTRIES; ++i) {
+            if(strcmp(entries.entries[i].name, name) == 0) {
+                uuid_t fcb_uuid;
+                FileControlBlock fcb;
+                memcpy(&fcb_uuid, entries.entries[i].fcb_ref, sizeof(uuid_t));
+
+                bytesRead = sizeof(fcb);
+
+                rc = unqlite_kv_fetch(pDb, fcb_uuid, KEY_SIZE, &fcb, &bytesRead);
+                error_handler(rc);
+                
+                if(fcb.mode & S_IFREG) {
+                    
+                    removeFileData(fcb.data_ref);
+
+                    unqlite_kv_delete(pDb, fcb_uuid, KEY_SIZE);
+
+                    memset(&entries.entries[i], 0, sizeof(entries.entries[i]));
+
+                    entries.usedEntries -= 1;
+                    rc = unqlite_kv_store(pDb, dirBlock->data_ref, KEY_SIZE, &entries, sizeof entries);
+                    error_handler(rc);
+                    
+                    return 0;
+                }
+                else {
+                    return -EISDIR;
+                }
+            }
+        }
+        return -ENOENT;
+    }
+    return -ENOTDIR;
+}
+
+static int removeDirectoryFCBinDirectory(const FileControlBlock* dirBlock, const char* name) {
+    if(strlen(name) >= MAX_FILENAME_SIZE) return -ENAMETOOLONG;
+    
     if(dirBlock->mode & S_IFDIR) {
         DirectoryDataBlock entries;
         unqlite_int64 bytesRead = sizeof entries;
@@ -313,20 +407,76 @@ static int myfs_read(const char *path, char *buf, size_t size, off_t offset, str
     return -ENOENT;
 }
 
-// This file system only supports one file. Create should fail if a file has been created. Path must be '/<something>'.
+// Create a file
 // Read 'man 2 creat'.
 static int myfs_create(const char *path, mode_t mode, struct fuse_file_info *fi){   
     write_log("myfs_create(path=\"%s\", mode=0%03o, fi=0x%08x)\n", path, mode, fi);
     
-    return -ENOENT;
+    char* basenameCopy = strdup(path);
+    char* dirnameCopy = strdup(path);
+
+    char* name = basename(basenameCopy);
+    
+    if(strlen(name) >= MAX_FILENAME_SIZE) {
+        free(basenameCopy);
+        free(dirnameCopy);
+        return -ENAMETOOLONG;
+    }
+    
+    char* pathToDir = dirname(dirnameCopy);
+    
+    FileControlBlock currentDir;
+
+    int rc = getFCBAtPath(pathToDir, &currentDir, NULL);
+
+    if(rc != 0){ 
+        free(basenameCopy);
+        free(dirnameCopy);
+        return rc;
+    }
+
+    FileControlBlock newFCB;
+
+    createFileNode(&newFCB, mode);
+
+    uuid_t newFileRef = {0};
+
+    uuid_generate(newFileRef);
+
+    rc = unqlite_kv_store(pDb,newFileRef, KEY_SIZE, &newFCB, sizeof newFCB);
+
+    error_handler(rc);
+
+    rc = addFCBToDirectory(&currentDir,name,newFileRef);
+
+    // TODO: Add error handling for when the name is already used. Currently, the DB is populated with something that has no 
+    // reference.
+
+    free(basenameCopy);
+    free(dirnameCopy);
+    return rc;
 }
 
 // Set update the times (actime, modtime) for a file. This FS only supports modtime.
 // Read 'man 2 utime'.
-static int myfs_utime(const char *path, struct utimbuf *ubuf){
-    write_log("myfs_utime(path=\"%s\")\n", path, ubuf);
-    
-    return -ENOENT;
+static int myfs_utimens(const char *path, const struct timespec tv[2]){
+    write_log("myfs_utimens(path=\"%s\")\n", path);
+
+    FileControlBlock fcb;
+    uuid_t fcbUUID;
+
+    int rc = getFCBAtPath(path, &fcb, &fcbUUID);
+
+    if(rc != 0) return rc;
+
+    memcpy(&fcb.st_atim, &tv[0], sizeof(struct timespec));
+    memcpy(&fcb.st_mtim, &tv[1], sizeof(struct timespec));
+
+    rc = unqlite_kv_store(pDb,fcbUUID,KEY_SIZE,&fcb, sizeof(fcb));
+
+    error_handler(rc);
+
+    return 0;
 }
 
 // Write to a file.
@@ -358,7 +508,22 @@ int myfs_chmod(const char *path, mode_t mode){
 int myfs_chown(const char *path, uid_t uid, gid_t gid){   
     write_log("myfs_chown(path=\"%s\", uid=%d, gid=%d)\n", path, uid, gid);
     
-    return -ENOENT;
+    FileControlBlock block;
+    uuid_t blockUUID;
+
+    int rc = getFCBAtPath(path, &block, &blockUUID);
+
+    if(rc != 0) return rc;
+
+    block.user_id = uid;
+    block.group_id = gid;
+
+    unqlite_int64 nBytes = sizeof(block);
+    rc = unqlite_kv_store(pDb,blockUUID, KEY_SIZE, &block, sizeof(block));
+
+    error_handler(rc);
+
+    return 0;
 }
 
 // Create a directory.
@@ -415,7 +580,28 @@ int myfs_mkdir(const char *path, mode_t mode){
 int myfs_unlink(const char *path){
     write_log("myfs_unlink(path=\"%s\")\n",path);	
     
-    return -ENOENT;
+    char* pathCopy = strdup(path);
+    char* pathCopy2 = strdup(path);
+
+    char* name = basename(pathCopy);
+    char* pathToDir = dirname(pathCopy2);
+
+    FileControlBlock parentDir;
+
+    int rc = getFCBAtPath(pathToDir, &parentDir, NULL);
+
+    if(rc != 0) {
+        free(pathCopy);
+        free(pathCopy2);
+        return rc;
+    }
+
+    rc = removeFileFCBinDirectory(&parentDir,name);
+
+    free(pathCopy);
+    free(pathCopy2);
+
+    return rc;    
 }
 
 // Delete a directory.
@@ -439,7 +625,7 @@ int myfs_rmdir(const char *path){
         return rc;
     }
 
-    rc = removeFCBInDirectory(&parentDir,name);
+    rc = removeDirectoryFCBinDirectory(&parentDir,name);
 
     free(pathCopy);
     free(pathCopy2);
@@ -479,14 +665,14 @@ static struct fuse_operations myfs_oper = {
     .readdir	= myfs_readdir,
     .mkdir      = myfs_mkdir,
     .rmdir      = myfs_rmdir,
-    .open		= myfs_open,
     .read		= myfs_read,
     .create		= myfs_create,
-    .utime 		= myfs_utime,
+    .utimens 	= myfs_utimens,
     .write		= myfs_write,
     .truncate	= myfs_truncate,
-    .flush		= myfs_flush,
-    .release	= myfs_release,
+    .unlink     = myfs_unlink,
+    .chown      = myfs_chown,
+    .chmod      = myfs_chmod
 };
 
 void shutdown_fs() {
@@ -500,6 +686,8 @@ int main(int argc, char *argv[]){
 	//Setup the log file and store the FILE* in the private data object for the file system.	
 	myfs_internal_state = malloc(sizeof(struct myfs_state));
     myfs_internal_state->logfile = init_log_file();
+
+    uuid_clear(zero_uuid);
 	
 	//Initialise the file system. This is being done outside of fuse for ease of debugging.
 	init_fs();
