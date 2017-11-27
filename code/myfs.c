@@ -18,12 +18,12 @@ FileControlBlock root_directory;
 DirectoryDataBlock emptyDirectory;
 FileDataBlock emptyFile;
 
-static size_t min(ssize_t a, ssize_t b) {
+static ssize_t min(ssize_t a, ssize_t b) {
     if(a < b) return a;
     return b;
 }
 
-static size_t max(ssize_t a, ssize_t b) {
+static ssize_t max(ssize_t a, ssize_t b) {
     if(a > b) return a;
     return b;
 }
@@ -348,101 +348,6 @@ static int removeDirectoryFCBinDirectory(const FileControlBlock* dirBlock, const
     return -ENOTDIR;
 }
 
-
-// static int writeInBlockchain(uuid_t nodeRef, const char* buf,size_t size, off_t offset) {
-//     FileDataBlock block;
-
-//     unqlite_int64 nBytes = sizeof(block);
-
-//     int rc = unqlite_kv_fetch(pDb, nodeRef, KEY_SIZE, &block, &nBytes);
-//     error_handler(rc);
-
-//     if(offset < BLOCK_SIZE) {
-//         ssize_t remainingBytes = size - (BLOCK_SIZE - offset);
-
-//         if(remainingBytes < 0) {
-//             memcpy(&block.data[offset], buf, size);
-//             block.size = offset + size;
-//             rc = 0;
-//         }
-//         else {
-//             memcpy(&block.data[offset], buf, BLOCK_SIZE - offset);
-//             block.size = BLOCK_SIZE;
-//             if(uuid_compare(block.nextBlock, zero_uuid) == 0) {
-//                 uuid_t newUUID;
-//                 uuid_generate(newUUID);
-//                 rc = unqlite_kv_store(pDb, newUUID, KEY_SIZE, &emptyFile, sizeof(emptyFile));
-//                 error_handler(rc);
-//                 uuid_copy(block.nextBlock, newUUID);
-//             }
-
-//             rc = writeInBlockchain(block.nextBlock, &buf[BLOCK_SIZE - offset], remainingBytes, 0);
-//         }
-
-//         if(rc != 0) return rc;
-
-//         rc = unqlite_kv_store(pDb,nodeRef,KEY_SIZE,&block,sizeof(block));
-
-//         error_handler(rc);
-//     }
-//     else {
-//         if(uuid_compare(block.nextBlock, zero_uuid) == 0) {
-//             uuid_t newUUID;
-//             uuid_generate(newUUID);
-//             rc = unqlite_kv_store(pDb, newUUID, KEY_SIZE, &emptyFile, sizeof(emptyFile));
-//             error_handler(rc);
-//             uuid_copy(block.nextBlock, newUUID);
-//         }
-
-//         rc = writeInBlockchain(block.nextBlock, buf, size, offset - BLOCK_SIZE);
-//         if(rc != 0) return rc;
-//     }
-
-//     return 0;
-// }
-
-// int readFromBlockchain(uuid_t nodeRef, char* buf,size_t size, off_t offset) {
-//     FileDataBlock block;
-
-//     unqlite_int64 nBytes = sizeof(block);
-
-//     int rc = unqlite_kv_fetch(pDb, nodeRef, KEY_SIZE, &block, &nBytes);
-//     error_handler(rc);
-
-//     if(offset < BLOCK_SIZE) {
-//         ssize_t remainingBytes = size - (block.size - offset);
-
-//         if(remainingBytes < 0) {
-//             memcpy(buf, &block.data[offset], min(block.size - offset,size));
-//             rc = 0;
-//         }
-//         else {
-//             memcpy(buf, &block.data[offset], max(size - offset, 0));
-//             if(uuid_compare(block.nextBlock, zero_uuid) == 0) {
-//                 return -EOVERFLOW;
-//             }
-
-//             rc = readFromBlockchain(block.nextBlock, &buf[BLOCK_SIZE - offset], remainingBytes, 0);
-//         }
-
-//         if(rc != 0) return rc;
-
-//         rc = unqlite_kv_store(pDb,nodeRef,KEY_SIZE,&block,sizeof(block));
-
-//         error_handler(rc);
-//     }
-//     else {
-//         if(uuid_compare(block.nextBlock, zero_uuid) == 0) {
-//             return -EOVERFLOW;
-//         }
-
-//         rc = writeInBlockchain(block.nextBlock, buf, size, offset - BLOCK_SIZE);
-//         if(rc != 0) return rc;
-//     }
-
-//     return 0;
-// }
-
 static void init_fs() {
     int rc = unqlite_open(&pDb,DATABASE_NAME,UNQLITE_OPEN_CREATE);
     if( rc != UNQLITE_OK ) error_handler(rc);
@@ -630,7 +535,7 @@ static int myfs_create(const char *path, mode_t mode, struct fuse_file_info *fi)
     
     // In case new blocks were added.
     int dbRc = unqlite_kv_store(pDb, parentFCBUUID, KEY_SIZE, &currentDir, sizeof(currentDir));
-    error_handler(rc);
+    error_handler(dbRc);
 
     // TODO: Add error handling for when the name is already used. Currently, the DB is populated with something that has no 
     // reference.
@@ -665,11 +570,12 @@ static int myfs_utimens(const char *path, const struct timespec tv[2]){
 static ssize_t writeToBlock(FileDataBlock *dest, const char* buf, off_t offset, size_t size) {
     off_t start = offset, end = start + size;
 
-    if(start > BLOCK_SIZE) return -1;
+    if(start >= BLOCK_SIZE) return -1;
 
     ssize_t bytesWritten = min(end, BLOCK_SIZE) - start;
 
     memcpy(&dest->data[start], buf, bytesWritten);
+    
     dest->size = start + bytesWritten;
 
     return bytesWritten;
@@ -687,7 +593,7 @@ static int myfs_write(const char *path, const char *buf, size_t size, off_t offs
 
     if(rc != 0) return rc;
 
-    size_t newFileSize = offset + size;
+    size_t savedOffset = offset;
 
     ssize_t bytesWritten = 0;
     if(S_ISREG(fcb.mode)) {
@@ -701,7 +607,7 @@ static int myfs_write(const char *path, const char *buf, size_t size, off_t offs
             }
             else {
                 unqlite_int64 nBytes = sizeof(dataBlock);
-                rc = unqlite_kv_fetch(pDb, fcb.data_blocks[bytesWritten], KEY_SIZE, &dataBlock, &nBytes);
+                rc = unqlite_kv_fetch(pDb, fcb.data_blocks[blockIdx], KEY_SIZE, &dataBlock, &nBytes);
                 error_handler(rc);
             }
 
@@ -718,10 +624,11 @@ static int myfs_write(const char *path, const char *buf, size_t size, off_t offs
             }
         }
 
-        fcb.size = max(fcb.size, newFileSize);
+        fcb.size = max(fcb.size, savedOffset + bytesWritten);
 
         rc = unqlite_kv_store(pDb, fileUUID, KEY_SIZE, &fcb, sizeof(fcb));
         error_handler(rc);
+
 
         return bytesWritten;
     }
@@ -793,7 +700,6 @@ static int myfs_chmod(const char *path, mode_t mode){
 
     block.mode |= mode;
 
-    unqlite_int64 nBytes = sizeof(block);
     rc = unqlite_kv_store(pDb,blockUUID, KEY_SIZE, &block, sizeof(block));
 
     error_handler(rc);
@@ -816,7 +722,6 @@ static int myfs_chown(const char *path, uid_t uid, gid_t gid) {
     block.user_id = uid;
     block.group_id = gid;
 
-    unqlite_int64 nBytes = sizeof(block);
     rc = unqlite_kv_store(pDb,blockUUID, KEY_SIZE, &block, sizeof(block));
 
     error_handler(rc);
@@ -867,7 +772,7 @@ int myfs_mkdir(const char *path, mode_t mode){
 
     // In case new blocks were added.
     int dbRc = unqlite_kv_store(pDb, parentFCBUUID, KEY_SIZE, &currentDir, sizeof(currentDir));
-    error_handler(rc);
+    error_handler(dbRc);
 
     // TODO: Add error handling for when the name is already used. Currently, the DB is populated with something that has no 
     // reference.
