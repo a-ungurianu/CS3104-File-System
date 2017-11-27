@@ -18,12 +18,12 @@ FileControlBlock root_directory;
 DirectoryDataBlock emptyDirectory;
 FileDataBlock emptyFile;
 
-static size_t min(size_t a, size_t b) {
+static size_t min(ssize_t a, ssize_t b) {
     if(a < b) return a;
     return b;
 }
 
-static size_t max(size_t a, size_t b) {
+static size_t max(ssize_t a, ssize_t b) {
     if(a > b) return a;
     return b;
 }
@@ -572,7 +572,7 @@ static int myfs_read(const char *path, char *buf, size_t size, off_t offset, str
             }
             else {
                 bytesRead += bR;
-                offset -= bR;
+                offset = max(0, offset - bR);
                 size -= bR;
             }
 
@@ -712,7 +712,7 @@ static int myfs_write(const char *path, const char *buf, size_t size, off_t offs
             else {
                 rc = unqlite_kv_store(pDb, fcb.data_blocks[blockIdx], KEY_SIZE, &dataBlock, sizeof(dataBlock));
                 error_handler(rc);
-                offset -= bW;
+                offset = max(0, offset - bW);
                 size -= bW;
                 bytesWritten += bW;
             }
