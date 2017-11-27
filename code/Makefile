@@ -1,5 +1,5 @@
-CC=gcc
-CFLAGS=-I. -g -D_FILE_OFFSET_BITS=64 -I/usr/include/fuse
+CC=clang
+CFLAGS=-I. -g -D_FILE_OFFSET_BITS=64 -I/usr/include/fuse -Wall
 LIBS = -luuid -lfuse -pthread -lm
 DEPS = myfs.h unqlite.h
 OBJ = unqlite.o
