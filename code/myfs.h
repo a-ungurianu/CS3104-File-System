@@ -10,9 +10,12 @@
 #include <fuse.h>
 
 #define MAX_FILENAME_SIZE 256
-#define MY_MAX_FILE_SIZE 1000
-#define MAX_DIRECTORY_ENTRIES 100
+#define DIRECTORY_ENTRIES_PER_BLOCK 4
 #define BLOCK_SIZE 1024
+
+#define NO_DIRECT_BLOCKS 16
+
+#define MAX_FILE_SIZE (BLOCK_SIZE * NO_DIRECT_BLOCKS)
 
 const mode_t DEFAULT_FILE_MODE = S_IFREG|S_IRUSR|S_IWUSR|S_IRGRP|S_IWGRP|S_IROTH;
 const mode_t DEFAULT_DIR_MODE = S_IFDIR|S_IRUSR|S_IWUSR|S_IXUSR|S_IRGRP|S_IXGRP|S_IROTH|S_IXOTH;
@@ -24,25 +27,22 @@ typedef struct _DirectoryEntry {
 
 typedef struct _DirectoryDataBlock {
     int usedEntries;
-    DirectoryEntry entries[MAX_DIRECTORY_ENTRIES];
+    DirectoryEntry entries[DIRECTORY_ENTRIES_PER_BLOCK];
 } DirectoryDataBlock;
 
 typedef struct _FileDataBlock {
     int size;
     char data[BLOCK_SIZE];
-    uuid_t nextBlock;
 } FileDataBlock;
 
 typedef struct _FileControlBlock {
-    uuid_t          data_ref;
-
     mode_t          mode;        /* File type and mode */
     // nlink_t   st_nlink;       /* Number of hard links */ // Maybe implement?
     uid_t           user_id;         /* User ID of owner */
     gid_t           group_id;         /* Group ID of owner */
     off_t           size;        /* Total size, in bytes */
-    // blksize_t st_blksize;     /* Block size for filesystem I/O */ // TODO: Maybe make blocks a thing?
-    // blkcnt_t  st_blocks;      /* Number of 512B blocks allocated */
+
+    uuid_t data_blocks[16];
 
     struct timespec st_atim;  /* Time of last access */
     struct timespec st_mtim;  /* Time of last modification */
@@ -50,8 +50,7 @@ typedef struct _FileControlBlock {
 } FileControlBlock;
 
 // We need to use a well-known value as a key for the root object.
-#define ROOT_OBJECT_KEY "root"
-#define ROOT_OBJECT_KEY_SIZE 4
+const uuid_t ROOT_OBJECT_KEY = "LongLiveTheKing";
 
 // This is the size of a regular key used to fetch things from the 
 // database. We use uuids as keys, so 16 bytes each
