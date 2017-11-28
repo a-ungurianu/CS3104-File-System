@@ -72,7 +72,7 @@ static void createFileNode(FileControlBlock* blockToFill, mode_t mode) {
 static int addFCBToDirectory(FileControlBlock* dirBlock, const char* name, uuid_t fcb_ref) {
     if(strlen(name) >= MAX_FILENAME_SIZE) return -ENAMETOOLONG;
 
-    if(dirBlock->mode & S_IFDIR) {
+    if(S_ISDIR(dirBlock->mode)) {
         for(int blockIdx = 0; blockIdx < NO_DIRECT_BLOCKS; ++blockIdx) {
             DirectoryDataBlock entries;
             unqlite_int64 bytesRead = sizeof entries;
@@ -130,7 +130,7 @@ static int addFCBToDirectory(FileControlBlock* dirBlock, const char* name, uuid_
 static int getFCBInDirectory(const FileControlBlock* dirBlock, const char* name, FileControlBlock* toFill, uuid_t *uuidToFill) {
     if(strlen(name) >= MAX_FILENAME_SIZE) return -ENAMETOOLONG;
     
-    if(dirBlock->mode & S_IFDIR) {
+    if(S_ISDIR(dirBlock->mode)) {
         DirectoryDataBlock entries;
         unqlite_int64 bytesRead = sizeof entries;
         for(int blockIdx = 0; blockIdx < NO_DIRECT_BLOCKS; ++blockIdx) {
@@ -212,6 +212,42 @@ static void removeNodeData(FileControlBlock *fcb) {
     }   
 }
 
+static int unlinkLinkinDirectory(const FileControlBlock* dirBlock, const char* name) {
+    if(strlen(name) >= MAX_FILENAME_SIZE) return -ENAMETOOLONG;
+    
+    if(dirBlock->mode & S_IFDIR) {
+        DirectoryDataBlock entries;
+        unqlite_int64 bytesRead = sizeof entries;
+
+        for(int blockIdx = 0; blockIdx < DIRECTORY_ENTRIES_PER_BLOCK; ++blockIdx) {
+            if(uuid_compare(dirBlock->data_blocks[blockIdx], zero_uuid) == 0) break;
+
+            bytesRead = sizeof entries;
+
+            int rc = unqlite_kv_fetch(pDb, dirBlock->data_blocks[blockIdx], KEY_SIZE, &entries, &bytesRead);
+            error_handler(rc);
+
+            if(bytesRead != sizeof entries) {
+                write_log("Directory data block is corrupted. Exiting...\n");
+                exit(-1);
+            }
+
+            for(int i = 0; i < DIRECTORY_ENTRIES_PER_BLOCK; ++i) {
+                if(strcmp(entries.entries[i].name, name) == 0) {
+                    memset(&entries.entries[i], 0, sizeof(entries.entries[i]));
+                    entries.usedEntries -= 1;
+                    rc = unqlite_kv_store(pDb, dirBlock->data_blocks[blockIdx], KEY_SIZE, &entries, sizeof entries);
+                    error_handler(rc);
+                    
+                    return 0;
+                }
+            }
+        }
+        return -ENOENT;
+    }
+    return -ENOTDIR;
+}
+
 static int removeFileFCBinDirectory(const FileControlBlock* dirBlock, const char* name) {
     if(strlen(name) >= MAX_FILENAME_SIZE) return -ENAMETOOLONG;
     
@@ -242,9 +278,9 @@ static int removeFileFCBinDirectory(const FileControlBlock* dirBlock, const char
 
                     rc = unqlite_kv_fetch(pDb, fcb_uuid, KEY_SIZE, &fcb, &bytesRead);
                     error_handler(rc);
-                    
-                    if(fcb.mode & S_IFREG) {
                         
+                    if(S_ISREG(fcb.mode)) {
+
                         removeNodeData(&fcb);
 
                         unqlite_kv_delete(pDb, fcb_uuid, KEY_SIZE);
@@ -254,12 +290,12 @@ static int removeFileFCBinDirectory(const FileControlBlock* dirBlock, const char
                         entries.usedEntries -= 1;
                         rc = unqlite_kv_store(pDb, dirBlock->data_blocks[blockIdx], KEY_SIZE, &entries, sizeof entries);
                         error_handler(rc);
-                        
-                        return 0;
                     }
                     else {
                         return -EISDIR;
                     }
+                    
+                    return 0;
                 }
             }
         }
@@ -859,9 +895,87 @@ int myfs_release(const char *path, struct fuse_file_info *fi){
 // Open a file. Open should check if the operation is permitted for the given flags (fi->flags).
 // Read 'man 2 open'.
 static int myfs_open(const char *path, struct fuse_file_info *fi){  
-    write_log("myfs_open(path\"%s\")\n", path);
+    write_log("myfs_open(path=\"%s\")\n", path);
     
     return -ENOENT;
+}
+
+static int myfs_rename(const char* from, const char* to) {
+    write_log("myfs_rename(from=\"%s\", to=\"%s\")", from, to);
+
+    char* sourceCopy = strdup(from);
+    char* sourceCopy2 = strdup(from);
+
+    char* sourceName = basename(sourceCopy);
+    char* sourceParent = dirname(sourceCopy2);
+
+    uuid_t sourceDirUUID;
+    FileControlBlock sourceDirFCB;
+
+    int rc = getFCBAtPath(sourceParent, &sourceDirFCB, &sourceDirUUID);
+    if(rc != 0) return rc;
+
+    uuid_t sourceUUID;
+    FileControlBlock sourceFCB;
+
+    rc = getFCBInDirectory(&sourceDirFCB, sourceName, &sourceFCB, &sourceUUID);
+    if(rc != 0) return rc;
+
+    char* pathCopy = strdup(to);
+    char* pathCopy2 = strdup(to);
+
+    char* targetName = basename(pathCopy);
+    char* pathToTargetDir = dirname(pathCopy2);
+
+    uuid_t targetDirUUID;
+    FileControlBlock targetParentFCB;
+    FileControlBlock* targetParentFCBPtr;
+
+    if(strcmp(pathToTargetDir, sourceParent) == 0) {
+        targetParentFCBPtr = &sourceDirFCB;
+        uuid_copy(targetDirUUID, sourceDirUUID);
+    }
+    else {
+        targetParentFCBPtr = &targetParentFCB;
+        rc = getFCBAtPath(pathToTargetDir, targetParentFCBPtr, &targetDirUUID);
+        if(rc != 0) return rc;
+    }
+
+    FileControlBlock targetFcb;
+
+    rc = getFCBInDirectory(targetParentFCBPtr, targetName, &targetFcb, NULL);
+
+    if(rc == 0) {
+        if(S_ISDIR(targetFcb.mode)) {
+            rc = removeDirectoryFCBinDirectory(targetParentFCBPtr, targetName);
+            if(rc != 0) return rc;
+        }
+        else {
+            rc = removeFileFCBinDirectory(targetParentFCBPtr, targetName);
+            if(rc != 0) return rc;
+        }
+
+        rc = addFCBToDirectory(targetParentFCBPtr, targetName, sourceUUID);
+        if(rc != 0) return rc;
+    }
+    else if(rc == -ENOENT) {
+        rc = addFCBToDirectory(targetParentFCBPtr, targetName, sourceUUID);
+        if(rc != 0) return rc;
+    }
+    else {
+        return rc;
+    }
+    
+    rc = unlinkLinkinDirectory(&sourceDirFCB, sourceName);
+    if(rc != 0) return rc;
+
+    rc = unqlite_kv_store(pDb, targetDirUUID, KEY_SIZE, targetParentFCBPtr, sizeof(targetParentFCB));
+    error_handler(rc);
+
+    rc = unqlite_kv_store(pDb, sourceDirUUID, KEY_SIZE, &sourceDirFCB, sizeof(sourceDirFCB));
+    error_handler(rc);
+
+    return 0;
 }
 
 // This struct contains pointers to all the functions defined above
@@ -879,7 +993,8 @@ static struct fuse_operations myfs_oper = {
     .truncate	= myfs_truncate,
     .unlink     = myfs_unlink,
     .chown      = myfs_chown,
-    .chmod      = myfs_chmod
+    .chmod      = myfs_chmod,
+    .rename     = myfs_rename
 };
 
 void shutdown_fs() {
