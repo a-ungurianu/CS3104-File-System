@@ -14,10 +14,13 @@ all: $(TARGET1)
 $(TARGET1): $(TARGET1).o $(OBJ)
 	gcc -o $@ $^ $(CFLAGS) $(LIBS)
 
-.PHONY: clean
+.PHONY: clean unmount mount
 
-clean:
+clean: unmount
 	rm -f *.o *~ core myfs.db myfs.log $(TARGET1)
 
 unmount:
-	fusermount -u test
+	-fusermount -u test
+
+mount: unmount
+	./myfs test
