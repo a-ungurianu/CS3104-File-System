@@ -9,6 +9,12 @@
 
 #include "myfs.h"
 
+typedef struct {
+    char* parent;
+    char* name;
+    char* savedPtrs[2];
+} SplitPath;
+
 unqlite* pDb;
 
 uuid_t zero_uuid;
@@ -26,6 +32,27 @@ static ssize_t min(ssize_t a, ssize_t b) {
 static ssize_t max(ssize_t a, ssize_t b) {
     if(a > b) return a;
     return b;
+}
+
+static SplitPath splitPath(const char* path) {
+    char* basenameCopy = strdup(path);
+    char* dirnameCopy = strdup(path);
+
+    char* bn = basename(basenameCopy);
+    char* dn = dirname(dirnameCopy);
+
+    SplitPath result = {
+        .parent = dn,
+        .name = bn,
+        .savedPtrs = {dirnameCopy, basenameCopy}
+    };
+
+    return result;
+}
+
+static void freeSplitPath(SplitPath* path) {
+    free(path->savedPtrs[0]);
+    free(path->savedPtrs[1]);
 }
 
 static void setTimespecToNow(struct timespec* tm) {
@@ -53,7 +80,6 @@ static void createDirectoryNode(FileControlBlock* blockToFill, mode_t mode) {
 
     blockToFill->user_id = getuid();
     blockToFill->group_id = getgid();
-
 }
 
 static void createFileNode(FileControlBlock* blockToFill, mode_t mode) {
@@ -531,27 +557,20 @@ static int myfs_read(const char *path, char *buf, size_t size, off_t offset, str
 static int myfs_create(const char *path, mode_t mode, struct fuse_file_info *fi){   
     write_log("myfs_create(path=\"%s\", mode=0%03o, fi=0x%08x)\n", path, mode, fi);
     
-    char* basenameCopy = strdup(path);
-    char* dirnameCopy = strdup(path);
-
-    char* name = basename(basenameCopy);
+    SplitPath newPath = splitPath(path);
     
-    if(strlen(name) >= MAX_FILENAME_SIZE) {
-        free(basenameCopy);
-        free(dirnameCopy);
+    if(strlen(newPath.name) >= MAX_FILENAME_SIZE) {
+        freeSplitPath(&newPath); 
         return -ENAMETOOLONG;
     }
-    
-    char* pathToDir = dirname(dirnameCopy);
     
     FileControlBlock currentDir;
 
     uuid_t parentFCBUUID;
-    int rc = getFCBAtPath(pathToDir, &currentDir, &parentFCBUUID);
+    int rc = getFCBAtPath(newPath.parent, &currentDir, &parentFCBUUID);
 
     if(rc != 0){ 
-        free(basenameCopy);
-        free(dirnameCopy);
+        freeSplitPath(&newPath);
         return rc;
     }
 
@@ -567,7 +586,7 @@ static int myfs_create(const char *path, mode_t mode, struct fuse_file_info *fi)
 
     error_handler(rc);
 
-    rc = addFCBToDirectory(&currentDir,name,newFileRef);
+    rc = addFCBToDirectory(&currentDir,newPath.name,newFileRef);
     
     // In case new blocks were added.
     int dbRc = unqlite_kv_store(pDb, parentFCBUUID, KEY_SIZE, &currentDir, sizeof(currentDir));
@@ -576,8 +595,7 @@ static int myfs_create(const char *path, mode_t mode, struct fuse_file_info *fi)
     // TODO: Add error handling for when the name is already used. Currently, the DB is populated with something that has no 
     // reference.
 
-    free(basenameCopy);
-    free(dirnameCopy);
+    freeSplitPath(&newPath);
     return rc;
 }
 
@@ -770,26 +788,19 @@ static int myfs_chown(const char *path, uid_t uid, gid_t gid) {
 int myfs_mkdir(const char *path, mode_t mode){
     write_log("myfs_mkdir(path=\"%s\", mode=0%03o)\n", path, mode);	
     
-    char* basenameCopy = strdup(path);
-    char* dirnameCopy = strdup(path);
-
-    char* name = basename(basenameCopy);
-    
-    if(strlen(name) >= MAX_FILENAME_SIZE) {
-        free(basenameCopy);
-        free(dirnameCopy);
+    SplitPath newPath = splitPath(path);
+   
+    if(strlen(newPath.name) >= MAX_FILENAME_SIZE) {
+        freeSplitPath(&newPath);
         return -ENAMETOOLONG;
     }
     
-    char* pathToDir = dirname(dirnameCopy);
-    
     FileControlBlock currentDir;
     uuid_t parentFCBUUID;
-    int rc = getFCBAtPath(pathToDir, &currentDir, &parentFCBUUID);
+    int rc = getFCBAtPath(newPath.parent, &currentDir, &parentFCBUUID);
 
     if(rc != 0){ 
-        free(basenameCopy);
-        free(dirnameCopy);
+        freeSplitPath(&newPath);
         return rc;
     }
 
@@ -804,7 +815,7 @@ int myfs_mkdir(const char *path, mode_t mode){
 
     error_handler(rc);
 
-    rc = addFCBToDirectory(&currentDir,name,newDirectoryRef);
+    rc = addFCBToDirectory(&currentDir, newPath.name, newDirectoryRef);
 
     // In case new blocks were added.
     int dbRc = unqlite_kv_store(pDb, parentFCBUUID, KEY_SIZE, &currentDir, sizeof(currentDir));
@@ -813,8 +824,7 @@ int myfs_mkdir(const char *path, mode_t mode){
     // TODO: Add error handling for when the name is already used. Currently, the DB is populated with something that has no 
     // reference.
 
-    free(basenameCopy);
-    free(dirnameCopy);
+    freeSplitPath(&newPath);
     return rc;
 }
 
@@ -823,26 +833,20 @@ int myfs_mkdir(const char *path, mode_t mode){
 int myfs_unlink(const char *path){
     write_log("myfs_unlink(path=\"%s\")\n",path);	
     
-    char* pathCopy = strdup(path);
-    char* pathCopy2 = strdup(path);
-
-    char* name = basename(pathCopy);
-    char* pathToDir = dirname(pathCopy2);
+    SplitPath pathToRemove = splitPath(path);
 
     FileControlBlock parentDir;
 
-    int rc = getFCBAtPath(pathToDir, &parentDir, NULL);
+    int rc = getFCBAtPath(pathToRemove.parent, &parentDir, NULL);
 
     if(rc != 0) {
-        free(pathCopy);
-        free(pathCopy2);
+        freeSplitPath(&pathToRemove);
         return rc;
     }
 
-    rc = removeFileFCBinDirectory(&parentDir,name);
+    rc = removeFileFCBinDirectory(&parentDir,pathToRemove.name);
 
-    free(pathCopy);
-    free(pathCopy2);
+    freeSplitPath(&pathToRemove);
 
     return rc;    
 }
@@ -852,26 +856,20 @@ int myfs_unlink(const char *path){
 int myfs_rmdir(const char *path){
     write_log("myfs_rmdir(path=\"%s\")\n",path);	
     
-    char* pathCopy = strdup(path);
-    char* pathCopy2 = strdup(path);
-
-    char* name = basename(pathCopy);
-    char* pathToDir = dirname(pathCopy2);
+   SplitPath pathToRemove = splitPath(path);
 
     FileControlBlock parentDir;
 
-    int rc = getFCBAtPath(pathToDir, &parentDir, NULL);
+    int rc = getFCBAtPath(pathToRemove.parent, &parentDir, NULL);
 
     if(rc != 0) {
-        free(pathCopy);
-        free(pathCopy2);
+        freeSplitPath(&pathToRemove);
         return rc;
     }
 
-    rc = removeDirectoryFCBinDirectory(&parentDir,name);
+    rc = removeDirectoryFCBinDirectory(&parentDir,pathToRemove.name);
 
-    free(pathCopy);
-    free(pathCopy2);
+    freeSplitPath(&pathToRemove);
     return rc;
 }
 
@@ -903,71 +901,94 @@ static int myfs_open(const char *path, struct fuse_file_info *fi){
 static int myfs_rename(const char* from, const char* to) {
     write_log("myfs_rename(from=\"%s\", to=\"%s\")", from, to);
 
-    char* sourceCopy = strdup(from);
-    char* sourceCopy2 = strdup(from);
-
-    char* sourceName = basename(sourceCopy);
-    char* sourceParent = dirname(sourceCopy2);
+    SplitPath fromPath = splitPath(from);
 
     uuid_t sourceDirUUID;
     FileControlBlock sourceDirFCB;
 
-    int rc = getFCBAtPath(sourceParent, &sourceDirFCB, &sourceDirUUID);
-    if(rc != 0) return rc;
-
+    int rc = getFCBAtPath(fromPath.parent, &sourceDirFCB, &sourceDirUUID);
+    if(rc != 0) {
+        freeSplitPath(&fromPath);
+        return rc;
+    }
     uuid_t sourceUUID;
     FileControlBlock sourceFCB;
 
-    rc = getFCBInDirectory(&sourceDirFCB, sourceName, &sourceFCB, &sourceUUID);
-    if(rc != 0) return rc;
+    rc = getFCBInDirectory(&sourceDirFCB, fromPath.name, &sourceFCB, &sourceUUID);
+    if(rc != 0) {
+        freeSplitPath(&fromPath);
+        return rc;
+    }
 
-    char* pathCopy = strdup(to);
-    char* pathCopy2 = strdup(to);
-
-    char* targetName = basename(pathCopy);
-    char* pathToTargetDir = dirname(pathCopy2);
+    SplitPath toPath = splitPath(to);
 
     uuid_t targetDirUUID;
     FileControlBlock targetParentFCB;
     FileControlBlock* targetParentFCBPtr;
 
-    if(strcmp(pathToTargetDir, sourceParent) == 0) {
+    if(strcmp(toPath.parent, fromPath.parent) == 0) {
         targetParentFCBPtr = &sourceDirFCB;
         uuid_copy(targetDirUUID, sourceDirUUID);
     }
     else {
         targetParentFCBPtr = &targetParentFCB;
-        rc = getFCBAtPath(pathToTargetDir, targetParentFCBPtr, &targetDirUUID);
-        if(rc != 0) return rc;
+        rc = getFCBAtPath(toPath.parent, targetParentFCBPtr, &targetDirUUID);
+        if(rc != 0) {
+            freeSplitPath(&fromPath);
+            freeSplitPath(&toPath);
+            return rc;
+        }
     }
 
     FileControlBlock targetFcb;
 
-    rc = getFCBInDirectory(targetParentFCBPtr, targetName, &targetFcb, NULL);
+    rc = getFCBInDirectory(targetParentFCBPtr, toPath.name, &targetFcb, NULL);
 
     if(rc == 0) {
         if(S_ISDIR(targetFcb.mode)) {
-            rc = removeDirectoryFCBinDirectory(targetParentFCBPtr, targetName);
-            if(rc != 0) return rc;
+            rc = removeDirectoryFCBinDirectory(targetParentFCBPtr, toPath.name);
+            if(rc != 0) {
+                freeSplitPath(&fromPath);
+                freeSplitPath(&toPath);
+                return rc;
+            }
         }
         else {
-            rc = removeFileFCBinDirectory(targetParentFCBPtr, targetName);
-            if(rc != 0) return rc;
+            rc = removeFileFCBinDirectory(targetParentFCBPtr, toPath.name);
+            if(rc != 0) {
+                freeSplitPath(&fromPath);
+                freeSplitPath(&toPath);
+                return rc;
+            }
         }
 
-        rc = addFCBToDirectory(targetParentFCBPtr, targetName, sourceUUID);
-        if(rc != 0) return rc;
+        rc = addFCBToDirectory(targetParentFCBPtr, toPath.name, sourceUUID);
+        if(rc != 0) {
+            freeSplitPath(&fromPath);
+            freeSplitPath(&toPath);
+            return rc;
+        }
     }
     else if(rc == -ENOENT) {
-        rc = addFCBToDirectory(targetParentFCBPtr, targetName, sourceUUID);
-        if(rc != 0) return rc;
+        rc = addFCBToDirectory(targetParentFCBPtr, toPath.name, sourceUUID);
+        if(rc != 0) {
+            freeSplitPath(&fromPath);
+            freeSplitPath(&toPath);
+            return rc;
+        }
     }
     else {
+        freeSplitPath(&fromPath);
+        freeSplitPath(&toPath);
         return rc;
     }
     
-    rc = unlinkLinkinDirectory(&sourceDirFCB, sourceName);
-    if(rc != 0) return rc;
+    rc = unlinkLinkinDirectory(&sourceDirFCB, fromPath.name);
+    if(rc != 0) {
+        freeSplitPath(&fromPath);
+        freeSplitPath(&toPath);
+        return rc;
+    }
 
     rc = unqlite_kv_store(pDb, targetDirUUID, KEY_SIZE, targetParentFCBPtr, sizeof(targetParentFCB));
     error_handler(rc);
@@ -975,6 +996,8 @@ static int myfs_rename(const char* from, const char* to) {
     rc = unqlite_kv_store(pDb, sourceDirUUID, KEY_SIZE, &sourceDirFCB, sizeof(sourceDirFCB));
     error_handler(rc);
 
+    freeSplitPath(&fromPath);
+    freeSplitPath(&toPath);
     return 0;
 }
 
