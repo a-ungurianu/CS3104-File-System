@@ -10,8 +10,8 @@
 #include <fuse.h>
 
 #define MAX_FILENAME_SIZE 256
-#define DIRECTORY_ENTRIES_PER_BLOCK 4
-#define BLOCK_SIZE 1024
+#define DIRECTORY_ENTRIES_PER_BLOCK 15
+#define BLOCK_SIZE 4096
 #define UUIDS_PER_BLOCK (BLOCK_SIZE / sizeof(uuid_t))
 
 #define NO_DIRECT_BLOCKS 15
