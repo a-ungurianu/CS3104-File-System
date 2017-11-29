@@ -16,6 +16,12 @@ typedef struct {
     int extends; // set to not 0 if this should allocate blocks that it doesn't find
 } FCBBlockIterator;
 
+/**
+ * Create a block iterator for the given FileControlBlock
+ * @param [in] fcb      - The file control block whose data blocks to iterate
+ * @param [in] extends  - Set to not 0 if you want the iterator to create new blocks when a next block is requested
+ * @return - The created iterator
+ */
 static FCBBlockIterator makeBlockIterator(FileControlBlock* fcb, int extends) {
     FCBBlockIterator result = {
         .fcb = fcb,
@@ -27,6 +33,14 @@ static FCBBlockIterator makeBlockIterator(FileControlBlock* fcb, int extends) {
     return result;
 }
 
+/**
+ * Get the next block from a given FCB block iterator
+ * @param [in]  iterator    - The iterator to retrieve the next block from
+ * @param [out] block       - The data block to fill in with the retrieved block
+ * @param [in]  blockSize   - The size of the block to be retrieved
+ * @param [out] blockUUID   - If not NULL, gets filled in with the uuid of the retrieved block
+ * @return The pointer passed in from block, or NULL if there are no more blocks to retrieve
+ */
 static void* getNextBlock(FCBBlockIterator* iterator, void* block, size_t blockSize, uuid_t* blockUUID) {
     uuid_t toFetch = {0};
 
@@ -103,14 +117,15 @@ static void* getNextBlock(FCBBlockIterator* iterator, void* block, size_t blockS
 }
 
 typedef struct {
-    char* parent;
-    char* name;
-    char* savedPtrs[2];
+    char* parent;       // String containing the parent directory of a path
+    char* name;         // String containing the name of the file a path points at
+    char* savedPtrs[2]; // Pointers to be freed when the SplitPath is not needed anymore
 } SplitPath;
 
-unqlite* pDb;
 
-uuid_t zero_uuid;
+unqlite* pDb; // Pointer used to reference the database connection
+
+uuid_t zero_uuid; // An uuid that has all its bytes set to 0
 
 DirectoryDataBlock emptyDirectory;
 FileDataBlock emptyFile;
@@ -125,6 +140,11 @@ static ssize_t max(ssize_t a, ssize_t b) {
     return b;
 }
 
+/**
+ * Split a path into it's filename and parent directory
+ * @param [in]  path - The path to split
+ * @return A SplitPath object containing the 2 parts of the path
+ */
 static SplitPath splitPath(const char* path) {
     char* basenameCopy = strdup(path);
     char* dirnameCopy = strdup(path);
@@ -141,11 +161,19 @@ static SplitPath splitPath(const char* path) {
     return result;
 }
 
+/**
+ * Free the pointers of a split path.
+ * @param [in]  path - The SplitPath object to be freed
+ */
 static void freeSplitPath(SplitPath* path) {
     free(path->savedPtrs[0]);
     free(path->savedPtrs[1]);
 }
 
+/**
+ * Set a given timespec to current date and time
+ * @param [out] tm - The timespec to set
+ */
 static void setTimespecToNow(struct timespec* tm) {
     struct timespec now;
     timespec_get(&now, TIME_UTC);
@@ -153,6 +181,11 @@ static void setTimespecToNow(struct timespec* tm) {
     memcpy(tm, &now, sizeof(now));
 }
 
+/**
+ * Fetch the root file control block from the database
+ * @param [out] rootBlock - The block to be filled in with the root FCB
+ * @return 0 if successful, <0 if an error happened.
+ */
 static int fetchRootFCB(FileControlBlock *rootBlock) {
     
     unqlite_int64 nBytes = sizeof(FileControlBlock);
@@ -161,6 +194,11 @@ static int fetchRootFCB(FileControlBlock *rootBlock) {
     return 0;
 }
 
+/**
+ * Initialize a FCB to be a new empty directory
+ * @param [out] blockToFill - The block to initialize
+ * @param [in]  mode        - The mode of the newly created node
+ */
 static void createDirectoryNode(FileControlBlock* blockToFill, mode_t mode) {
     memset(blockToFill, 0, sizeof(FileControlBlock));
     blockToFill->mode = S_IFDIR | mode;
@@ -173,6 +211,11 @@ static void createDirectoryNode(FileControlBlock* blockToFill, mode_t mode) {
     blockToFill->group_id = getgid();
 }
 
+/**
+ * Initialize a FCB to be a new empty file
+ * @param [out] blockToFill - The block to initialize
+ * @param [in]  mode        - The mode of the newly created node
+ */
 static void createFileNode(FileControlBlock* blockToFill, mode_t mode) {
     memset(blockToFill, 0, sizeof(FileControlBlock));
     blockToFill->mode = S_IFREG | mode;
@@ -186,6 +229,13 @@ static void createFileNode(FileControlBlock* blockToFill, mode_t mode) {
 
 }
 
+/**
+ * Add a new link into a directory
+ * @param [in,out]  dirBlock - The directory node in which to add the new link
+ * @param [in]      name     - The name of the link
+ * @param [in]      fcb_ref  - The uuid reference to the node to link to
+ * @return 0 if successful, < 0 if an error happened.
+ */
 static int addFCBToDirectory(FileControlBlock* dirBlock, const char* name, const uuid_t fcb_ref) {
     if(strlen(name) >= MAX_FILENAME_SIZE) return -ENAMETOOLONG;
 
@@ -225,6 +275,14 @@ static int addFCBToDirectory(FileControlBlock* dirBlock, const char* name, const
     return -ENOTDIR;
 }
 
+/**
+ * Retrieve a node from a directory
+ * @param [in]  dirBlock    - The directory node to retrieve the node from
+ * @param [in]  name        - The name of the link to retrieve
+ * @param [out] toFill      - The block to fill in with the retrieved FCB
+ * @param [out] uuidToFill  - If not NULL, this is filled in with the reference to the retrieved node
+ * @return 0 if successful, < 0 if an error happened.
+ */
 static int getFCBInDirectory(const FileControlBlock* dirBlock, const char* name, FileControlBlock* toFill, uuid_t *uuidToFill) {
     if(strlen(name) >= MAX_FILENAME_SIZE) return -ENAMETOOLONG;
     
@@ -261,6 +319,13 @@ static int getFCBInDirectory(const FileControlBlock* dirBlock, const char* name,
     return -ENOTDIR;
 }
 
+/**
+ * Get the file control block of the node found at the given path
+ * @param [in]  path        - The path where the node should be located at
+ * @param [out] toFill      - The block to be filled with the retrieved FCB.
+ * @param [out] uuidToFill  - If not NULL, this is filled in with the uuid of the retrieved block
+ * @return 0 if successful, < 0 if an error happened.
+ */
 static int getFCBAtPath(const char* path, FileControlBlock* toFill, uuid_t *uuidToFill) { 
     
     char* pathCopy = strdup(path);
@@ -290,7 +355,34 @@ static int getFCBAtPath(const char* path, FileControlBlock* toFill, uuid_t *uuid
     return 0;
 }
 
+/**
+ * Retrieve the number of children of a given directory
+ * @param [in] directory
+ * @return The number of children the directory has, or a negative number on error
+ */
+static ssize_t numberOfChildren(const FileControlBlock* directory) {
+    if(S_ISDIR(directory->mode)) {
+        ssize_t noDirectories = 0;
+        FCBBlockIterator iter = makeBlockIterator(directory, 0);
+        DirectoryDataBlock entries;
 
+        uuid_t blockUUID;
+
+        while(getNextBlock(&iter, &entries, sizeof(entries), &blockUUID) != NULL) {
+            noDirectories += entries.usedEntries;
+        }
+
+        return noDirectories;
+    }
+
+    return -ENOTDIR;
+}
+
+
+/**
+ * Remove all the data an FCB holds reference to
+ * @param [in] fcb - The FCB whose data to remove
+ */
 static void removeNodeData(FileControlBlock *fcb) {
     char fakeBlock[BLOCK_SIZE];
     uuid_t blockUUID;
@@ -303,6 +395,12 @@ static void removeNodeData(FileControlBlock *fcb) {
     }
 }
 
+/**
+ * Remove the link from a directory, without deleting the node it points to
+ * @param [in,out]  dirBlock - The block from which to remove the link
+ * @param [in]      name     - The name of the link to remove
+ * @return 0 if successful, < 0 if an error happened.
+ */
 static int unlinkLinkInDirectory(const FileControlBlock *dirBlock, const char *name) {
     if(strlen(name) >= MAX_FILENAME_SIZE) return -ENAMETOOLONG;
     
@@ -329,6 +427,12 @@ static int unlinkLinkInDirectory(const FileControlBlock *dirBlock, const char *n
     return -ENOTDIR;
 }
 
+/**
+ * Remove a file from a directory. This both unlinks the file and deletes the node the link pointed to.
+ * @param [in,out]  dirBlock - The directory node that should have the file removed
+ * @param [in]      name     - The name of the file to be removed
+ * @return 0 if successful, < 0 if an error happened.
+ */
 static int removeFileFCBinDirectory(const FileControlBlock* dirBlock, const char* name) {
     if(strlen(name) >= MAX_FILENAME_SIZE) return -ENAMETOOLONG;
     
@@ -376,24 +480,12 @@ static int removeFileFCBinDirectory(const FileControlBlock* dirBlock, const char
     return -ENOTDIR;
 }
 
-static ssize_t numberOfChildren(const FileControlBlock* directory) {
-    if(S_ISDIR(directory->mode)) {
-        ssize_t noDirectories = 0;
-        FCBBlockIterator iter = makeBlockIterator(directory, 0);
-        DirectoryDataBlock entries;
-
-        uuid_t blockUUID;
-
-        while(getNextBlock(&iter, &entries, sizeof(entries), &blockUUID) != NULL) {
-            noDirectories += entries.usedEntries;
-        }
-
-        return noDirectories;
-    }
-
-    return -EISDIR;
-}
-
+/**
+ * Remove a directory from a directory. This both unlinks the directory and deletes the node the link pointed to.
+ * @param [in,out]  dirBlock - The directory node that should have the directory removed
+ * @param [in]      name     - The name of the directory to be removed
+ * @return 0 if successful, < 0 if an error happened.
+ */
 static int removeDirectoryFCBinDirectory(const FileControlBlock* dirBlock, const char* name) {
     if(strlen(name) >= MAX_FILENAME_SIZE) return -ENAMETOOLONG;
     
@@ -446,6 +538,9 @@ static int removeDirectoryFCBinDirectory(const FileControlBlock* dirBlock, const
     return -ENOTDIR;
 }
 
+/**
+ * Initialize the file system before mounting
+ */
 static void init_fs() {
     int rc = unqlite_open(&pDb,DATABASE_NAME,UNQLITE_OPEN_CREATE);
     if( rc != UNQLITE_OK ) error_handler(rc);
@@ -479,8 +574,12 @@ static void init_fs() {
 // reading, getting attributes, truncating, etc. They will be called by FUSE whenever it needs
 // your filesystem to do something, so this is where functionality goes.
 
-// Get file and directory attributes (meta-data).
-// Read 'man 2 stat' and 'man 2 chmod'.
+/**
+ * Get file and directory attributes (meta-data).
+ * @param [in]  path    - The path of the file whose metadata to retrieve
+ * @param [in]  stbuf   - The stat buffer to fill with the metadata
+ * @return 0 if successful, < 0 if an error happened.
+ */
 static int myfs_getattr(const char *path, struct stat *stbuf) {
     write_log("myfs_getattr(path=\"%s\")\n", path);
 
@@ -504,6 +603,15 @@ static int myfs_getattr(const char *path, struct stat *stbuf) {
 
 // Read a directory.
 // Read 'man 2 readdir'.
+/**
+ * List the links in a directory at a given path
+ * @param [in]  path    - The path to the directory whose links to iterate
+ * @param [out] buf     - An opaque buffer that needs to be passed to the filler function
+ * @param [in]  filler  - A function used to fill the buffer with the retrieved links
+ * @param [in]  offset  - !!UNUSED!!
+ * @param [in]  fi      - File handler (currently not used)
+ * @return 0 if successful, < 0 if an error happened.
+ */
 static int myfs_readdir(const char *path, void *buf, fuse_fill_dir_t filler, off_t offset, struct fuse_file_info *fi) {
     write_log("myfs_readdir(path=\"%s\")\n", path);
 
@@ -531,6 +639,14 @@ static int myfs_readdir(const char *path, void *buf, fuse_fill_dir_t filler, off
     return 0;
 }
 
+/**
+ * Reads data from a filesystem block
+ * @param [out] dest    - The buffer to fill in with the read information
+ * @param [in]  block   - The block to retrieve the information from
+ * @param [in]  offset  - The offset from where to read data from
+ * @param [in]  size    - The number of bytes to be read
+ * @return 0 if successful, < 0 if an error happened.
+ */
 static int readFromBlock(char* dest, FileDataBlock* block,  off_t offset, size_t size) {
     off_t start = offset, end = start + size;
 
@@ -542,8 +658,15 @@ static int readFromBlock(char* dest, FileDataBlock* block,  off_t offset, size_t
     return bytesToRead;
 }
 
-// Read a file.
-// Read 'man 2 read'.
+/**
+ * Read data from a file.
+ * @param [in]  path    - The path of the file to read from
+ * @param [out] buf     - The buffer to fill in with the read information
+ * @param [in]  size    - The number of bytes to be read
+ * @param [in]  offset  - The offset from where to read data from
+ * @param [in]  fi      - File handler (currently not used)
+ * @return 0 if successful, < 0 if an error happened.
+ */
 static int myfs_read(const char *path, char *buf, size_t size, off_t offset, struct fuse_file_info *fi){
     write_log("myfs_read(path=\"%s\", size=%zu, offset=%zu", path, size, offset);
     
@@ -580,9 +703,14 @@ static int myfs_read(const char *path, char *buf, size_t size, off_t offset, str
     }
 }
 
-// Create a file
-// Read 'man 2 creat'.
-static int myfs_create(const char *path, mode_t mode, struct fuse_file_info *fi){   
+/**
+ * Create a new file
+ * @param [in] path - The path at which to create the new file
+ * @param [in] mode - The permissions of the new file
+ * @param [in] fi   - File handler (currently not used)
+ * @return 0 if successful, < 0 if an error happened.
+ */
+static int myfs_create(const char *path, mode_t mode, struct fuse_file_info *fi){
     write_log("myfs_create(path=\"%s\", mode=0%03o, fi=0x%08x)\n", path, mode, fi);
     
     SplitPath newPath = splitPath(path);
@@ -627,8 +755,12 @@ static int myfs_create(const char *path, mode_t mode, struct fuse_file_info *fi)
     return rc;
 }
 
-// Set update the times (actime, modtime) for a file. This FS only supports modtime.
-// Read 'man 2 utime'.
+/**
+ * Update the times (actime, modtime) for a file.
+ * @param [in] path - The path of the node whose timestamps to update
+ * @param [in] tv   - The values to which the timestamps should be set to.
+ * @return 0 if successful, < 0 if an error happened.
+ */
 static int myfs_utimens(const char *path, const struct timespec tv[2]){
     write_log("myfs_utimens(path=\"%s\")\n", path);
 
@@ -649,6 +781,14 @@ static int myfs_utimens(const char *path, const struct timespec tv[2]){
     return 0;
 }
 
+/**
+ * Write data to a given data block
+ * @param [out] dest    - The block to write data into
+ * @param [in]  buf     - The data to write into the block
+ * @param [in]  offset  - The point at which to start writing data into the block
+ * @param [in]  size    - The amount of data to write into the block
+ * @return 0 if successful, < 0 if an error happened.
+ */
 static int writeToBlock(FileDataBlock *dest, const char* buf, off_t offset, size_t size) {
     off_t start = offset, end = start + size;
 
@@ -664,8 +804,14 @@ static int writeToBlock(FileDataBlock *dest, const char* buf, off_t offset, size
 
 }
 
-// Write to a file.
-// Read 'man 2 write'
+/**
+ * Write data to a file
+ * @param [in] path     - Path to the file in which to write the data
+ * @param [in]  buf     - The data to write into the file
+ * @param [in]  offset  - The point at which to start writing data into the file
+ * @param [in]  size    - The amount of data to write into the file
+ * @return 0 if successful, < 0 if an error happened.
+ */
 static int myfs_write(const char *path, const char *buf, size_t size, off_t offset, struct fuse_file_info *fi){   
     write_log("myfs_write(path=\"%s\", size=%d, offset=%lld,)\n", path, size, offset);
 
@@ -711,9 +857,13 @@ static int myfs_write(const char *path, const char *buf, size_t size, off_t offs
     }
 }
 
-// Set the size of a file.
-// Read 'man 2 truncate'.
-int myfs_truncate(const char *path, off_t newSize){    
+/**
+ * Set the size of a file. This allocates new blocks or removes blocks so that the file is the correct size
+ * @param [in] path     - The path of the file to resize
+ * @param [in] newSize  - The new size of the file
+ * @return 0 if successful, < 0 if an error happened.
+ */
+static int myfs_truncate(const char *path, off_t newSize){
     write_log("myfs_truncate(path=\"%s\", newSize=%lld)\n", path, newSize);
 
     off_t remainingSize = newSize;
@@ -827,6 +977,12 @@ int myfs_truncate(const char *path, off_t newSize){
 
 // Set permissions.
 // Read 'man 2 chmod'.
+/**
+ * Set the permissions of a file at a given path
+ * @param [in] path - The path of the file whose permissions to change
+ * @param [in] mode - The new permisison
+ * @return 0 if successful, < 0 if an error happened.
+ */
 static int myfs_chmod(const char *path, mode_t mode){
     write_log("myfs_chmod(path=\"%s\", mode=0%03o)\n", path, mode);
     
@@ -845,8 +1001,13 @@ static int myfs_chmod(const char *path, mode_t mode){
     return 0;
 }
 
-// Set ownership.
-// Read 'man 2 chown'.
+/**
+ * Change owning user and group of a given file
+ * @param [in] path - The path of the file whose owners to change
+ * @param [in] uid  - The new owning user
+ * @param [in] gid  - The new owning group
+ * @return 0 if successful, < 0 if an error happened.
+ */
 static int myfs_chown(const char *path, uid_t uid, gid_t gid) {   
     write_log("myfs_chown(path=\"%s\", uid=%d, gid=%d)\n", path, uid, gid);
     
@@ -867,9 +1028,13 @@ static int myfs_chown(const char *path, uid_t uid, gid_t gid) {
     return 0;
 }
 
-// Create a directory.
-// Read 'man 2 mkdir'.
-int myfs_mkdir(const char *path, mode_t mode){
+/**
+ * Create a new directory at the given path
+ * @param [in] path - The path at which to create the new directory
+ * @param [in] mode - The permissions of the new directory
+ * @return 0 if successful, < 0 if an error happened.
+ */
+static int myfs_mkdir(const char *path, mode_t mode){
     write_log("myfs_mkdir(path=\"%s\", mode=0%03o)\n", path, mode);	
     
     SplitPath newPath = splitPath(path);
@@ -912,9 +1077,12 @@ int myfs_mkdir(const char *path, mode_t mode){
     return rc;
 }
 
-// Delete a file.
-// Read 'man 2 unlink'.
-int myfs_unlink(const char *path){
+/**
+ * Remove the file at the given path
+ * @param [in] path - The path of the file to be removed
+ * @return 0 if successful, < 0 if an error happened.
+ */
+static int myfs_unlink(const char *path){
     write_log("myfs_unlink(path=\"%s\")\n",path);	
     
     SplitPath pathToRemove = splitPath(path);
@@ -935,9 +1103,12 @@ int myfs_unlink(const char *path){
     return rc;    
 }
 
-// Delete a directory.
-// Read 'man 2 rmdir'.
-int myfs_rmdir(const char *path){
+/**
+ * Remove the directory at the given path
+ * @param [in] path - The path of the directory to be removed
+ * @return 0 if successful, < 0 if an error happened.
+ */
+static int myfs_rmdir(const char *path){
     write_log("myfs_rmdir(path=\"%s\")\n",path);	
     
    SplitPath pathToRemove = splitPath(path);
@@ -955,31 +1126,6 @@ int myfs_rmdir(const char *path){
 
     freeSplitPath(&pathToRemove);
     return rc;
-}
-
-// OPTIONAL - included as an example
-// Flush any cached data.
-int myfs_flush(const char *path, struct fuse_file_info *fi){
-    write_log("myfs_flush(path=\"%s\")\n", path, fi);
-    
-    return -ENOENT;
-}
-
-// OPTIONAL - included as an example
-// Release the file. There will be one call to release for each call to open.
-int myfs_release(const char *path, struct fuse_file_info *fi){
-    write_log("myfs_release(path=\"%s\")\n", path);
-    
-    return -ENOENT;
-}
-
-// OPTIONAL - included as an example
-// Open a file. Open should check if the operation is permitted for the given flags (fi->flags).
-// Read 'man 2 open'.
-static int myfs_open(const char *path, struct fuse_file_info *fi){  
-    write_log("myfs_open(path=\"%s\")\n", path);
-    
-    return -ENOENT;
 }
 
 static int myfs_rename(const char* from, const char* to) {
