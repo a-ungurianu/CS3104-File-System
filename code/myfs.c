@@ -53,7 +53,7 @@ static void* getNextBlock(FCBBlockIterator* iterator, void* block, size_t blockS
             }
         } break;
         case 1: {
-
+            if(iterator->idx >= UUIDS_PER_BLOCK) return NULL;
             uuid_t blocks[UUIDS_PER_BLOCK] = {{0}};
             if(uuid_compare(iterator->fcb->indirectBlock, zero_uuid) == 0)  {
                 if(iterator->extends) {
@@ -85,7 +85,6 @@ static void* getNextBlock(FCBBlockIterator* iterator, void* block, size_t blockS
 
             iterator->idx += 1;
 
-            if(iterator->idx >= UUIDS_PER_BLOCK) return NULL;
         } break;
         default: return NULL;
     }
@@ -675,88 +674,35 @@ static int myfs_write(const char *path, const char *buf, size_t size, off_t offs
     int rc = getFCBAtPath(path, &fcb, &fileUUID);
 
     if(rc != 0) return rc;
+    if(size == 0) return 0;
 
     off_t savedOffset = offset;
 
     int bytesWritten = 0;
     if(S_ISREG(fcb.mode)) {
+        uuid_t blockUUID;
         FileDataBlock dataBlock;
-        for(int blockIdx = 0; blockIdx < NO_DIRECT_BLOCKS; ++blockIdx) {
-            if(size == 0) break;
+        FCBBlockIterator iter = makeBlockIterator(&fcb, 1);
 
-            if(uuid_compare(fcb.data_blocks[blockIdx], zero_uuid) == 0) {
-                uuid_generate(fcb.data_blocks[blockIdx]);
-                dataBlock = emptyFile;
-            }
-            else {
-                unqlite_int64 nBytes = sizeof(dataBlock);
-                rc = unqlite_kv_fetch(pDb, fcb.data_blocks[blockIdx], KEY_SIZE, &dataBlock, &nBytes);
-                error_handler(rc);
-            }
-
+        while(getNextBlock(&iter, &dataBlock, sizeof(dataBlock), &blockUUID)) {
             int bW = writeToBlock(&dataBlock, &buf[bytesWritten], offset, size);
             if(bW == -1) {
                 offset -= BLOCK_SIZE;
             }
             else {
-                rc = unqlite_kv_store(pDb, fcb.data_blocks[blockIdx], KEY_SIZE, &dataBlock, sizeof(dataBlock));
+                rc = unqlite_kv_store(pDb, blockUUID, KEY_SIZE, &dataBlock, sizeof(dataBlock));
                 error_handler(rc);
                 offset = max(0, offset - bW);
                 size -= bW;
                 bytesWritten += bW;
             }
-        }
-
-        if(size != 0) {
-            uuid_t blocks[UUIDS_PER_BLOCK] = {{0}};
-            if(uuid_compare(fcb.indirectBlock, zero_uuid) == 0) {
-                uuid_t indirectBlockUUID = {0};
-                uuid_generate(indirectBlockUUID);
-
-                rc = unqlite_kv_store(pDb, indirectBlockUUID, KEY_SIZE, &blocks, sizeof(uuid_t) * UUIDS_PER_BLOCK);
-                error_handler(rc);
-
-                uuid_copy(fcb.indirectBlock, indirectBlockUUID);
-            }
-
-            unqlite_int64 nBytes = sizeof(uuid_t) * UUIDS_PER_BLOCK;
-            rc = unqlite_kv_fetch(pDb, fcb.indirectBlock, KEY_SIZE, &blocks, &nBytes);
-            error_handler(rc);
-
-            for(int blockIdx = 0; blockIdx < UUIDS_PER_BLOCK; ++blockIdx) {
-                if(size == 0) break;
-
-                if(uuid_compare(blocks[blockIdx], zero_uuid) == 0) {
-                    uuid_generate(blocks[blockIdx]);
-                    dataBlock = emptyFile;
-                }
-                else {
-                    nBytes = sizeof(dataBlock);
-                    rc = unqlite_kv_fetch(pDb, blocks[blockIdx], KEY_SIZE, &dataBlock, &nBytes);
-                    error_handler(rc);
-                }
-
-                int bW = writeToBlock(&dataBlock, &buf[bytesWritten], offset, size);
-                if(bW == -1) {
-                    offset -= BLOCK_SIZE;
-                }
-                else {
-                    rc = unqlite_kv_store(pDb, blocks[blockIdx], KEY_SIZE, &dataBlock, sizeof(dataBlock));
-                    error_handler(rc);
-                    offset = max(0, offset - bW);
-                    size -= bW;
-                    bytesWritten += bW;
-                }
-            }
-            rc = unqlite_kv_store(pDb, fcb.indirectBlock, KEY_SIZE, &blocks, sizeof(uuid_t) * UUIDS_PER_BLOCK);
-            error_handler(rc);
+            if(size == 0) break;
         }
 
         fcb.size = max(fcb.size, savedOffset + bytesWritten);
 
         rc = unqlite_kv_store(pDb, fileUUID, KEY_SIZE, &fcb, sizeof(fcb));
         error_handler(rc);
-
 
         return bytesWritten;
     }
