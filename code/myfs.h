@@ -12,10 +12,11 @@
 #define MAX_FILENAME_SIZE 256
 #define DIRECTORY_ENTRIES_PER_BLOCK 4
 #define BLOCK_SIZE 1024
+#define UUIDS_PER_BLOCK (BLOCK_SIZE / sizeof(uuid_t))
 
-#define NO_DIRECT_BLOCKS 16
+#define NO_DIRECT_BLOCKS 15
 
-#define MAX_FILE_SIZE (BLOCK_SIZE * NO_DIRECT_BLOCKS)
+#define MAX_FILE_SIZE (BLOCK_SIZE * NO_DIRECT_BLOCKS + BLOCK_SIZE * UUIDS_PER_BLOCK)
 
 const mode_t DEFAULT_FILE_MODE = S_IFREG|S_IRUSR|S_IWUSR|S_IRGRP|S_IWGRP|S_IROTH;
 const mode_t DEFAULT_DIR_MODE = S_IFDIR|S_IRUSR|S_IWUSR|S_IXUSR|S_IRGRP|S_IXGRP|S_IROTH|S_IXOTH;
@@ -42,7 +43,8 @@ typedef struct _FileControlBlock {
     gid_t           group_id;         /* Group ID of owner */
     off_t           size;        /* Total size, in bytes */
 
-    uuid_t data_blocks[16];
+    uuid_t data_blocks[NO_DIRECT_BLOCKS];
+    uuid_t indirectBlock;
 
     struct timespec st_atim;  /* Time of last access */
     struct timespec st_mtim;  /* Time of last modification */

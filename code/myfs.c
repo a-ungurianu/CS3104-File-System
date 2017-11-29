@@ -3,11 +3,105 @@
 
 #include <fuse.h>
 #include <errno.h>
-#include <fcntl.h>
-#include <time.h>
 #include <libgen.h>
 
 #include "myfs.h"
+
+#define MAX_INDIRECTION_LEVEL 1
+
+typedef struct {
+    FileControlBlock *fcb;
+    size_t idx;
+    size_t level;
+    int extends; // set to not 0 if this should allocate blocks that it doesn't find
+} FCBBlockIterator;
+
+static FCBBlockIterator makeBlockIterator(FileControlBlock* fcb, int extends) {
+    FCBBlockIterator result = {
+        .fcb = fcb,
+        .idx = 0,
+        .level = 0,
+        .extends = extends
+    };
+
+    return result;
+}
+
+static void* getNextBlock(FCBBlockIterator* iterator, void* block, size_t blockSize, uuid_t* blockUUID) {
+    uuid_t toFetch = {0};
+
+    if(iterator->level > MAX_INDIRECTION_LEVEL) return NULL;
+
+    switch(iterator->level) {
+        case 0: {
+            if(iterator->extends && uuid_compare(iterator->fcb->data_blocks[iterator->idx], zero_uuid) == 0) {
+                uuid_generate(toFetch);
+                char* nothing = calloc(sizeof(char), blockSize);
+                int rc = unqlite_kv_store(pDb, toFetch, KEY_SIZE, nothing, (ssize_t) blockSize);
+                free(nothing);
+                error_handler(rc);
+                uuid_copy(iterator->fcb->data_blocks[iterator->idx], toFetch);
+            }
+            else {
+                uuid_copy(toFetch, iterator->fcb->data_blocks[iterator->idx]);
+            }
+
+            iterator->idx += 1;
+            if(iterator->idx >= NO_DIRECT_BLOCKS) {
+                iterator->idx = 0;
+                iterator->level += 1;
+            }
+        } break;
+        case 1: {
+
+            uuid_t blocks[UUIDS_PER_BLOCK] = {{0}};
+            if(uuid_compare(iterator->fcb->indirectBlock, zero_uuid) == 0)  {
+                if(iterator->extends) {
+                    uuid_generate(iterator->fcb->indirectBlock);
+                    int rc = unqlite_kv_store(pDb, iterator->fcb->indirectBlock, KEY_SIZE, &blocks, sizeof(uuid_t) * UUIDS_PER_BLOCK);
+                    error_handler(rc);
+                }
+                else {
+                    return NULL;
+                }
+            }
+            unqlite_int64 nBytes = UUIDS_PER_BLOCK * sizeof(uuid_t);
+            int rc = unqlite_kv_fetch(pDb, iterator->fcb->indirectBlock, KEY_SIZE, *blocks, &nBytes);
+            error_handler(rc);
+
+            if(iterator->extends && uuid_compare(blocks[iterator->idx], zero_uuid) == 0) {
+                uuid_generate(toFetch);
+                char* nothing = calloc(sizeof(char), blockSize);
+                rc = unqlite_kv_store(pDb, toFetch, KEY_SIZE, nothing, (ssize_t) blockSize);
+                free(nothing);
+                error_handler(rc);
+                uuid_copy(blocks[iterator->idx], toFetch); 
+                rc = unqlite_kv_store(pDb, iterator->fcb->indirectBlock, KEY_SIZE, *blocks, UUIDS_PER_BLOCK * sizeof(uuid_t));
+                error_handler(rc);
+            }
+            else {
+                uuid_copy(toFetch, blocks[iterator->idx]);
+            }
+
+            iterator->idx += 1;
+
+            if(iterator->idx >= UUIDS_PER_BLOCK) return NULL;
+        } break;
+        default: return NULL;
+    }
+
+    if(uuid_compare(toFetch, zero_uuid) == 0) return NULL;
+
+    if(blockUUID != NULL) {
+        uuid_copy(*blockUUID, toFetch);
+    }
+
+    unqlite_int64 nBytes = (unqlite_int64) blockSize;
+    int rc = unqlite_kv_fetch(pDb, toFetch, KEY_SIZE, block, &nBytes);
+    error_handler(rc);
+
+    return block;
+}
 
 typedef struct {
     char* parent;
@@ -18,8 +112,6 @@ typedef struct {
 unqlite* pDb;
 
 uuid_t zero_uuid;
-
-FileControlBlock root_directory;
 
 DirectoryDataBlock emptyDirectory;
 FileDataBlock emptyFile;
@@ -95,38 +187,19 @@ static void createFileNode(FileControlBlock* blockToFill, mode_t mode) {
 
 }
 
-static int addFCBToDirectory(FileControlBlock* dirBlock, const char* name, uuid_t fcb_ref) {
+static int addFCBToDirectory(FileControlBlock* dirBlock, const char* name, const uuid_t fcb_ref) {
     if(strlen(name) >= MAX_FILENAME_SIZE) return -ENAMETOOLONG;
 
     if(S_ISDIR(dirBlock->mode)) {
-        for(int blockIdx = 0; blockIdx < NO_DIRECT_BLOCKS; ++blockIdx) {
-            DirectoryDataBlock entries;
-            unqlite_int64 bytesRead = sizeof entries;
-            int rc;
-            if(uuid_compare(dirBlock->data_blocks[blockIdx], zero_uuid) == 0) {
-                uuid_t newBlockUUID;
-                uuid_generate(newBlockUUID);
-                rc = unqlite_kv_store(pDb, newBlockUUID, KEY_SIZE, &emptyDirectory, sizeof(emptyDirectory));
-                error_handler(rc);
-                uuid_copy(dirBlock->data_blocks[blockIdx], newBlockUUID);
-                dirBlock->size += BLOCK_SIZE;
-                memset(&entries,0,sizeof(entries));
-            }
-            else {
-                bytesRead = sizeof entries;
-                rc = unqlite_kv_fetch(pDb, dirBlock->data_blocks[blockIdx], KEY_SIZE, &entries, &bytesRead);
-                error_handler(rc);
+        FCBBlockIterator iter = makeBlockIterator(dirBlock, 1);
+        DirectoryDataBlock entries;
 
-                if(bytesRead != sizeof entries) {
-                    write_log("Directory data block is corrupted. Exiting...\n");
-                    exit(-1);
-                }
-            }
+        uuid_t blockUUID;
 
+        while(getNextBlock(&iter, &entries, sizeof(entries), &blockUUID) != NULL) {
             if(entries.usedEntries == DIRECTORY_ENTRIES_PER_BLOCK) {
                 continue;
             }
-
 
             for(int i = 0; i < DIRECTORY_ENTRIES_PER_BLOCK; ++i) {
                 if(strcmp(entries.entries[i].name,name) == 0) {
@@ -140,7 +213,7 @@ static int addFCBToDirectory(FileControlBlock* dirBlock, const char* name, uuid_
                     uuid_copy(entries.entries[i].fcb_ref, fcb_ref);
 
                     entries.usedEntries += 1;
-                    rc = unqlite_kv_store(pDb, dirBlock->data_blocks[blockIdx], KEY_SIZE, &entries, sizeof entries);
+                    int rc = unqlite_kv_store(pDb, blockUUID, KEY_SIZE, &entries, sizeof entries);
                     error_handler(rc);
                     return 0;
                 }
@@ -157,26 +230,17 @@ static int getFCBInDirectory(const FileControlBlock* dirBlock, const char* name,
     if(strlen(name) >= MAX_FILENAME_SIZE) return -ENAMETOOLONG;
     
     if(S_ISDIR(dirBlock->mode)) {
+        FCBBlockIterator iter = makeBlockIterator(dirBlock, 0);
         DirectoryDataBlock entries;
-        unqlite_int64 bytesRead = sizeof entries;
-        for(int blockIdx = 0; blockIdx < NO_DIRECT_BLOCKS; ++blockIdx) {
-            if(uuid_compare(dirBlock->data_blocks[blockIdx],zero_uuid) == 0) {
-                break;
-            }
-            bytesRead = sizeof entries;
-            int rc = unqlite_kv_fetch(pDb, dirBlock->data_blocks[blockIdx], KEY_SIZE, &entries, &bytesRead);
 
-            error_handler(rc);
+        uuid_t blockUUID;
 
-            if(bytesRead != sizeof entries) {
-                write_log("Directory data block is corrupted. Exiting...\n");
-                exit(-1);
-            }
-
+        while(getNextBlock(&iter, &entries, sizeof(entries), &blockUUID) != NULL) {
+            
             for(int i = 0; i < DIRECTORY_ENTRIES_PER_BLOCK; ++i) {
                 if(strcmp(entries.entries[i].name, name) == 0) {
-                    bytesRead = sizeof(FileControlBlock);
-                    rc = unqlite_kv_fetch(pDb, entries.entries[i].fcb_ref, KEY_SIZE, toFill, &bytesRead);
+                    unqlite_int64 bytesRead = sizeof(FileControlBlock);
+                    int rc = unqlite_kv_fetch(pDb, entries.entries[i].fcb_ref, KEY_SIZE, toFill, &bytesRead);
 
                     error_handler(rc);
 
@@ -229,40 +293,32 @@ static int getFCBAtPath(const char* path, FileControlBlock* toFill, uuid_t *uuid
 
 
 static void removeNodeData(FileControlBlock *fcb) {
+    char fakeBlock[BLOCK_SIZE];
+    uuid_t blockUUID;
 
-    for(int blockIdx = 0; blockIdx < NO_DIRECT_BLOCKS; ++blockIdx) {
-        if(uuid_compare(fcb->data_blocks[blockIdx], zero_uuid) == 0) break;
-        int rc = unqlite_kv_delete(pDb,fcb->data_blocks[blockIdx],KEY_SIZE);
+    FCBBlockIterator iter = makeBlockIterator(fcb, 0);
 
+    while(getNextBlock(&iter, fakeBlock, BLOCK_SIZE, &blockUUID)) {
+        int rc = unqlite_kv_delete(pDb, blockUUID, KEY_SIZE);
         error_handler(rc);
-    }   
+    }
 }
 
-static int unlinkLinkinDirectory(const FileControlBlock* dirBlock, const char* name) {
+static int unlinkLinkInDirectory(const FileControlBlock *dirBlock, const char *name) {
     if(strlen(name) >= MAX_FILENAME_SIZE) return -ENAMETOOLONG;
     
     if(dirBlock->mode & S_IFDIR) {
+        FCBBlockIterator iter = makeBlockIterator(dirBlock, 0);
         DirectoryDataBlock entries;
-        unqlite_int64 bytesRead = sizeof entries;
 
-        for(int blockIdx = 0; blockIdx < DIRECTORY_ENTRIES_PER_BLOCK; ++blockIdx) {
-            if(uuid_compare(dirBlock->data_blocks[blockIdx], zero_uuid) == 0) break;
+        uuid_t blockUUID;
 
-            bytesRead = sizeof entries;
-
-            int rc = unqlite_kv_fetch(pDb, dirBlock->data_blocks[blockIdx], KEY_SIZE, &entries, &bytesRead);
-            error_handler(rc);
-
-            if(bytesRead != sizeof entries) {
-                write_log("Directory data block is corrupted. Exiting...\n");
-                exit(-1);
-            }
-
+        while(getNextBlock(&iter, &entries, sizeof(entries), &blockUUID) != NULL) {
             for(int i = 0; i < DIRECTORY_ENTRIES_PER_BLOCK; ++i) {
                 if(strcmp(entries.entries[i].name, name) == 0) {
                     memset(&entries.entries[i], 0, sizeof(entries.entries[i]));
                     entries.usedEntries -= 1;
-                    rc = unqlite_kv_store(pDb, dirBlock->data_blocks[blockIdx], KEY_SIZE, &entries, sizeof entries);
+                    int rc = unqlite_kv_store(pDb, blockUUID, KEY_SIZE, &entries, sizeof entries);
                     error_handler(rc);
                     
                     return 0;
@@ -278,21 +334,12 @@ static int removeFileFCBinDirectory(const FileControlBlock* dirBlock, const char
     if(strlen(name) >= MAX_FILENAME_SIZE) return -ENAMETOOLONG;
     
     if(dirBlock->mode & S_IFDIR) {
+        FCBBlockIterator iter = makeBlockIterator(dirBlock, 0);
         DirectoryDataBlock entries;
-        unqlite_int64 bytesRead = sizeof entries;
 
-        for(int blockIdx = 0; blockIdx < DIRECTORY_ENTRIES_PER_BLOCK; ++blockIdx) {
-            if(uuid_compare(dirBlock->data_blocks[blockIdx], zero_uuid) == 0) break;
+        uuid_t blockUUID;
 
-            bytesRead = sizeof entries;
-
-            int rc = unqlite_kv_fetch(pDb, dirBlock->data_blocks[blockIdx], KEY_SIZE, &entries, &bytesRead);
-            error_handler(rc);
-
-            if(bytesRead != sizeof entries) {
-                write_log("Directory data block is corrupted. Exiting...\n");
-                exit(-1);
-            }
+        while(getNextBlock(&iter, &entries, sizeof(entries), &blockUUID) != NULL) {
 
             for(int i = 0; i < DIRECTORY_ENTRIES_PER_BLOCK; ++i) {
                 if(strcmp(entries.entries[i].name, name) == 0) {
@@ -300,9 +347,9 @@ static int removeFileFCBinDirectory(const FileControlBlock* dirBlock, const char
                     FileControlBlock fcb;
                     memcpy(&fcb_uuid, entries.entries[i].fcb_ref, sizeof(uuid_t));
 
-                    bytesRead = sizeof(fcb);
+                    unqlite_int64 bytesRead = sizeof(fcb);
 
-                    rc = unqlite_kv_fetch(pDb, fcb_uuid, KEY_SIZE, &fcb, &bytesRead);
+                    int rc = unqlite_kv_fetch(pDb, fcb_uuid, KEY_SIZE, &fcb, &bytesRead);
                     error_handler(rc);
                         
                     if(S_ISREG(fcb.mode)) {
@@ -314,7 +361,7 @@ static int removeFileFCBinDirectory(const FileControlBlock* dirBlock, const char
                         memset(&entries.entries[i], 0, sizeof(entries.entries[i]));
 
                         entries.usedEntries -= 1;
-                        rc = unqlite_kv_store(pDb, dirBlock->data_blocks[blockIdx], KEY_SIZE, &entries, sizeof entries);
+                        rc = unqlite_kv_store(pDb, blockUUID, KEY_SIZE, &entries, sizeof entries);
                         error_handler(rc);
                     }
                     else {
@@ -332,17 +379,16 @@ static int removeFileFCBinDirectory(const FileControlBlock* dirBlock, const char
 
 static ssize_t numberOfChildren(const FileControlBlock* directory) {
     if(S_ISDIR(directory->mode)) {
-        size_t noDirectories = 0;
-        DirectoryDataBlock block;
-        for(int blockIdx = 0; blockIdx < NO_DIRECT_BLOCKS; ++blockIdx) {
-            if(uuid_compare(directory->data_blocks[blockIdx],zero_uuid) == 0) {
-                break;
-            }
-            unqlite_int64 nBytes = sizeof(block);
-            int rc = unqlite_kv_fetch(pDb, directory->data_blocks[blockIdx],KEY_SIZE, &block, &nBytes);
-            error_handler(rc);
-            noDirectories += block.usedEntries;
+        ssize_t noDirectories = 0;
+        FCBBlockIterator iter = makeBlockIterator(directory, 0);
+        DirectoryDataBlock entries;
+
+        uuid_t blockUUID;
+
+        while(getNextBlock(&iter, &entries, sizeof(entries), &blockUUID) != NULL) {
+            noDirectories += entries.usedEntries;
         }
+
         return noDirectories;
     }
 
@@ -353,31 +399,21 @@ static int removeDirectoryFCBinDirectory(const FileControlBlock* dirBlock, const
     if(strlen(name) >= MAX_FILENAME_SIZE) return -ENAMETOOLONG;
     
     if(dirBlock->mode & S_IFDIR) {
+        FCBBlockIterator iter = makeBlockIterator(dirBlock, 0);
         DirectoryDataBlock entries;
-        unqlite_int64 bytesRead = sizeof entries;
 
-        for(int blockIdx = 0; blockIdx < NO_DIRECT_BLOCKS; ++blockIdx) {
-            if(uuid_compare(dirBlock->data_blocks[blockIdx],zero_uuid) == 0) {
-                break;
-            }
-            bytesRead = sizeof entries;
-            int rc = unqlite_kv_fetch(pDb, dirBlock->data_blocks[blockIdx], KEY_SIZE, &entries, &bytesRead);
-            error_handler(rc);
+        uuid_t blockUUID;
 
-            if(bytesRead != sizeof entries) {
-                write_log("Directory data block is corrupted. Exiting...\n");
-                exit(-1);
-            }
-
+        while(getNextBlock(&iter, &entries, sizeof(entries), &blockUUID) != NULL) {
             for(int i = 0; i < DIRECTORY_ENTRIES_PER_BLOCK; ++i) {
                 if(strcmp(entries.entries[i].name, name) == 0) {
                     uuid_t fcb_uuid;
                     FileControlBlock fcb;
                     memcpy(&fcb_uuid, entries.entries[i].fcb_ref, sizeof(uuid_t));
 
-                    bytesRead = sizeof(fcb);
+                    unqlite_int64 bytesRead = sizeof(fcb);
 
-                    rc = unqlite_kv_fetch(pDb, fcb_uuid, KEY_SIZE, &fcb, &bytesRead);
+                    int rc = unqlite_kv_fetch(pDb, fcb_uuid, KEY_SIZE, &fcb, &bytesRead);
                     error_handler(rc);
                     
                     if(S_ISDIR(fcb.mode)) {
@@ -394,7 +430,7 @@ static int removeDirectoryFCBinDirectory(const FileControlBlock* dirBlock, const
                         memset(&entries.entries[i], 0, sizeof(entries.entries[i]));
 
                         entries.usedEntries -= 1;
-                        rc = unqlite_kv_store(pDb, dirBlock->data_blocks[blockIdx], KEY_SIZE, &entries, sizeof entries);
+                        rc = unqlite_kv_store(pDb, blockUUID, KEY_SIZE, &entries, sizeof entries);
                         error_handler(rc);
                         
                         return 0;
@@ -405,6 +441,7 @@ static int removeDirectoryFCBinDirectory(const FileControlBlock* dirBlock, const
                 }
             }
         }
+
         return -ENOENT;
     }
     return -ENOTDIR;
@@ -414,16 +451,17 @@ static void init_fs() {
     int rc = unqlite_open(&pDb,DATABASE_NAME,UNQLITE_OPEN_CREATE);
     if( rc != UNQLITE_OK ) error_handler(rc);
     
-    unqlite_int64 bytesRead = sizeof root_directory;
+    unqlite_int64 bytesRead;
 
-    rc = unqlite_kv_fetch(pDb, ROOT_OBJECT_KEY, KEY_SIZE, &root_directory, &bytesRead);
+    rc = unqlite_kv_fetch(pDb, ROOT_OBJECT_KEY, KEY_SIZE, NULL, &bytesRead);
 
     if(rc == UNQLITE_NOTFOUND) {
         perror("Root of filesystem not found. Creating it...\n");
+        FileControlBlock rootDirectory;
 
-        createDirectoryNode(&root_directory, DEFAULT_DIR_MODE);
+        createDirectoryNode(&rootDirectory, DEFAULT_DIR_MODE);
 
-        rc = unqlite_kv_store(pDb, ROOT_OBJECT_KEY, KEY_SIZE, &root_directory, sizeof root_directory);
+        rc = unqlite_kv_store(pDb, ROOT_OBJECT_KEY, KEY_SIZE, &rootDirectory, sizeof rootDirectory);
 
         error_handler(rc);
     }
@@ -431,7 +469,7 @@ static void init_fs() {
         perror("Root of filesystem found. Using it as the root folder...\n");
         error_handler(rc);
 
-        if(bytesRead != sizeof root_directory) {
+        if(bytesRead != sizeof(FileControlBlock)) {
             perror("!!! Database is corrupted, exiting...\n");
             exit(-1);
         }
@@ -478,17 +516,12 @@ static int myfs_readdir(const char *path, void *buf, fuse_fill_dir_t filler, off
     filler(buf, ".", NULL, 0);
     filler(buf, "..", NULL, 0);
 
+    FCBBlockIterator iter = makeBlockIterator(&currentDirectory, 0);
     DirectoryDataBlock entries;
 
-    unqlite_int64 bytesRead = sizeof entries;
-    for(int blockIdx = 0; blockIdx < NO_DIRECT_BLOCKS; ++blockIdx) {
-        if(uuid_compare(currentDirectory.data_blocks[blockIdx],zero_uuid) == 0) break;
+    uuid_t blockUUID;
 
-        bytesRead = sizeof entries;
-        rc = unqlite_kv_fetch(pDb, currentDirectory.data_blocks[blockIdx], KEY_SIZE, &entries, &bytesRead);
-
-        error_handler(rc);
-
+    while(getNextBlock(&iter, &entries, sizeof(entries), &blockUUID) != NULL) {
         for(int i = 0; i < DIRECTORY_ENTRIES_PER_BLOCK; ++i) {
             if(strcmp(entries.entries[i].name,"") != 0) {
                 filler(buf, entries.entries[i].name, NULL, 0);
@@ -499,12 +532,12 @@ static int myfs_readdir(const char *path, void *buf, fuse_fill_dir_t filler, off
     return 0;
 }
 
-static off_t readFromBlock(char* dest, FileDataBlock* block,  off_t offset, size_t size) {
+static int readFromBlock(char* dest, FileDataBlock* block,  off_t offset, size_t size) {
     off_t start = offset, end = start + size;
 
-    if(start > block->size) return -1;
+    if(start >= block->size) return -1;
 
-    off_t bytesToRead = min(block->size - offset, end - start);
+    unsigned bytesToRead = (unsigned) min(block->size - start, end - start);
 
     memcpy(dest,&block->data[offset], bytesToRead);
     return bytesToRead;
@@ -521,19 +554,16 @@ static int myfs_read(const char *path, char *buf, size_t size, off_t offset, str
 
     if(rc != 0) return rc;
 
-    size_t bytesRead = 0;
+    unsigned bytesRead = 0;
     if(S_ISREG(fcb.mode)) {
-        FileDataBlock dataBlock;
-        for(int blockIdx = 0; blockIdx < NO_DIRECT_BLOCKS; ++blockIdx) {
-            if(uuid_compare(fcb.data_blocks[blockIdx], zero_uuid) == 0) {
-                break;
-            }
-            unqlite_int64 nBytes = sizeof(dataBlock);
-            int rc = unqlite_kv_fetch(pDb, fcb.data_blocks[blockIdx], KEY_SIZE, &dataBlock, &nBytes);
-            error_handler(rc);
 
+        FCBBlockIterator iter = makeBlockIterator(&fcb, 0);
+        FileDataBlock dataBlock;
+
+        while(getNextBlock(&iter, &dataBlock, sizeof(dataBlock), NULL)) {
+            if(size == 0) break;
             off_t bR = readFromBlock(&buf[bytesRead], &dataBlock, offset, size);
-            
+
             if(bR < 0) {
                 offset -= BLOCK_SIZE;
             }
@@ -542,7 +572,6 @@ static int myfs_read(const char *path, char *buf, size_t size, off_t offset, str
                 offset = max(0, offset - bR);
                 size -= bR;
             }
-
         }
 
         return bytesRead;
@@ -621,16 +650,16 @@ static int myfs_utimens(const char *path, const struct timespec tv[2]){
     return 0;
 }
 
-static ssize_t writeToBlock(FileDataBlock *dest, const char* buf, off_t offset, size_t size) {
+static int writeToBlock(FileDataBlock *dest, const char* buf, off_t offset, size_t size) {
     off_t start = offset, end = start + size;
 
     if(start >= BLOCK_SIZE) return -1;
 
-    ssize_t bytesWritten = min(end, BLOCK_SIZE) - start;
+    unsigned bytesWritten = (unsigned) (min(end, BLOCK_SIZE) - start);
 
     memcpy(&dest->data[start], buf, bytesWritten);
     
-    dest->size = start + bytesWritten;
+    dest->size = (int)(start + bytesWritten);
 
     return bytesWritten;
 
@@ -647,9 +676,9 @@ static int myfs_write(const char *path, const char *buf, size_t size, off_t offs
 
     if(rc != 0) return rc;
 
-    size_t savedOffset = offset;
+    off_t savedOffset = offset;
 
-    ssize_t bytesWritten = 0;
+    int bytesWritten = 0;
     if(S_ISREG(fcb.mode)) {
         FileDataBlock dataBlock;
         for(int blockIdx = 0; blockIdx < NO_DIRECT_BLOCKS; ++blockIdx) {
@@ -678,6 +707,51 @@ static int myfs_write(const char *path, const char *buf, size_t size, off_t offs
             }
         }
 
+        if(size != 0) {
+            uuid_t blocks[UUIDS_PER_BLOCK] = {{0}};
+            if(uuid_compare(fcb.indirectBlock, zero_uuid) == 0) {
+                uuid_t indirectBlockUUID = {0};
+                uuid_generate(indirectBlockUUID);
+
+                rc = unqlite_kv_store(pDb, indirectBlockUUID, KEY_SIZE, &blocks, sizeof(uuid_t) * UUIDS_PER_BLOCK);
+                error_handler(rc);
+
+                uuid_copy(fcb.indirectBlock, indirectBlockUUID);
+            }
+
+            unqlite_int64 nBytes = sizeof(uuid_t) * UUIDS_PER_BLOCK;
+            rc = unqlite_kv_fetch(pDb, fcb.indirectBlock, KEY_SIZE, &blocks, &nBytes);
+            error_handler(rc);
+
+            for(int blockIdx = 0; blockIdx < UUIDS_PER_BLOCK; ++blockIdx) {
+                if(size == 0) break;
+
+                if(uuid_compare(blocks[blockIdx], zero_uuid) == 0) {
+                    uuid_generate(blocks[blockIdx]);
+                    dataBlock = emptyFile;
+                }
+                else {
+                    nBytes = sizeof(dataBlock);
+                    rc = unqlite_kv_fetch(pDb, blocks[blockIdx], KEY_SIZE, &dataBlock, &nBytes);
+                    error_handler(rc);
+                }
+
+                int bW = writeToBlock(&dataBlock, &buf[bytesWritten], offset, size);
+                if(bW == -1) {
+                    offset -= BLOCK_SIZE;
+                }
+                else {
+                    rc = unqlite_kv_store(pDb, blocks[blockIdx], KEY_SIZE, &dataBlock, sizeof(dataBlock));
+                    error_handler(rc);
+                    offset = max(0, offset - bW);
+                    size -= bW;
+                    bytesWritten += bW;
+                }
+            }
+            rc = unqlite_kv_store(pDb, fcb.indirectBlock, KEY_SIZE, &blocks, sizeof(uuid_t) * UUIDS_PER_BLOCK);
+            error_handler(rc);
+        }
+
         fcb.size = max(fcb.size, savedOffset + bytesWritten);
 
         rc = unqlite_kv_store(pDb, fileUUID, KEY_SIZE, &fcb, sizeof(fcb));
@@ -698,7 +772,7 @@ int myfs_truncate(const char *path, off_t newSize){
 
     off_t remainingSize = newSize;
 
-    if(newSize > BLOCK_SIZE * NO_DIRECT_BLOCKS) {
+    if(newSize > MAX_FILE_SIZE) {
         return -EFBIG;
     }
 
@@ -718,18 +792,82 @@ int myfs_truncate(const char *path, off_t newSize){
         }
         else {
             if(uuid_compare(fileToResize.data_blocks[blockIdx], zero_uuid) == 0) {
-                uuid_t newBlockUUID;
+                uuid_t newBlockUUID = {0};
                 uuid_generate(newBlockUUID);
 
                 FileDataBlock block = emptyFile;
-                block.size = min(remainingSize, BLOCK_SIZE);
-                remainingSize -= remainingSize;
+                block.size = (int) min(remainingSize, BLOCK_SIZE);
+                remainingSize -= block.size;
 
-                int rc = unqlite_kv_store(pDb, newBlockUUID, KEY_SIZE, &block, sizeof(block));
+                rc = unqlite_kv_store(pDb, newBlockUUID, KEY_SIZE, &block, sizeof(block));
                 error_handler(rc);
+
+                uuid_copy(fileToResize.data_blocks[blockIdx], newBlockUUID);
             }
         }
     }
+
+    // Handle first level of indirection
+    if(remainingSize == 0) {
+        if(uuid_compare(fileToResize.indirectBlock, zero_uuid) != 0) {
+            uuid_t blocks[UUIDS_PER_BLOCK];
+            unqlite_int64 nBytes = sizeof(uuid_t) * UUIDS_PER_BLOCK;
+            rc = unqlite_kv_fetch(pDb, fileToResize.indirectBlock, KEY_SIZE, &blocks, &nBytes);
+            error_handler(rc);
+
+            for(int blockIdx = 0; blockIdx < UUIDS_PER_BLOCK; ++blockIdx) {
+                if(uuid_compare(blocks[blockIdx], zero_uuid) != 0) {
+                    unqlite_kv_delete(pDb,blocks[blockIdx], KEY_SIZE);
+                    memset(&blocks[blockIdx], 0, KEY_SIZE);
+                }
+            }
+        }
+        unqlite_kv_delete(pDb, fileToResize.indirectBlock, KEY_SIZE);
+        memset(fileToResize.indirectBlock, 0, KEY_SIZE);
+    }
+    else {
+        uuid_t blocks[UUIDS_PER_BLOCK] = {{0}};
+        if(uuid_compare(fileToResize.indirectBlock, zero_uuid) == 0) {
+            uuid_t indirectBlockUUID = {0};
+            uuid_generate(indirectBlockUUID);
+
+            rc = unqlite_kv_store(pDb, indirectBlockUUID, KEY_SIZE, &blocks, sizeof(uuid_t) * UUIDS_PER_BLOCK);
+            error_handler(rc);
+
+            uuid_copy(fileToResize.indirectBlock, indirectBlockUUID);
+        }
+
+        unqlite_int64 nBytes = sizeof(uuid_t) * UUIDS_PER_BLOCK;
+        rc = unqlite_kv_fetch(pDb, fileToResize.indirectBlock, KEY_SIZE, &blocks, &nBytes);
+        error_handler(rc);
+
+        for(int blockIdx = 0; blockIdx < UUIDS_PER_BLOCK; ++blockIdx) {
+            if(remainingSize == 0) {
+                if(uuid_compare(blocks[blockIdx], zero_uuid) != 0) {
+                    unqlite_kv_delete(pDb,blocks[blockIdx], KEY_SIZE);
+                    memset(&blocks[blockIdx], 0, KEY_SIZE);
+                }
+            }
+            else {
+                if(uuid_compare(blocks[blockIdx], zero_uuid) == 0) {
+                    uuid_t newBlockUUID = {0};
+                    uuid_generate(newBlockUUID);
+
+                    FileDataBlock block = emptyFile;
+                    block.size = (int) min(remainingSize, BLOCK_SIZE);
+                    remainingSize -= block.size;
+
+                    rc = unqlite_kv_store(pDb, newBlockUUID, KEY_SIZE, &block, sizeof(block));
+                    error_handler(rc);
+                    
+                    uuid_copy(blocks[blockIdx], newBlockUUID);
+                }
+            }
+        }
+        rc = unqlite_kv_store(pDb, fileToResize.indirectBlock, KEY_SIZE, &blocks, sizeof(blocks));
+        error_handler(rc);
+    }
+
 
     fileToResize.size = newSize;
 
@@ -922,7 +1060,7 @@ static int myfs_rename(const char* from, const char* to) {
 
     SplitPath toPath = splitPath(to);
 
-    uuid_t targetDirUUID;
+    uuid_t targetDirUUID = {0};
     FileControlBlock targetParentFCB;
     FileControlBlock* targetParentFCBPtr;
 
@@ -931,7 +1069,7 @@ static int myfs_rename(const char* from, const char* to) {
         uuid_copy(targetDirUUID, sourceDirUUID);
     }
     else {
-        targetParentFCBPtr = &targetParentFCB;
+        targetParentFCBPtr = & targetParentFCB;
         rc = getFCBAtPath(toPath.parent, targetParentFCBPtr, &targetDirUUID);
         if(rc != 0) {
             freeSplitPath(&fromPath);
@@ -983,7 +1121,7 @@ static int myfs_rename(const char* from, const char* to) {
         return rc;
     }
     
-    rc = unlinkLinkinDirectory(&sourceDirFCB, fromPath.name);
+    rc = unlinkLinkInDirectory(&sourceDirFCB, fromPath.name);
     if(rc != 0) {
         freeSplitPath(&fromPath);
         freeSplitPath(&toPath);
