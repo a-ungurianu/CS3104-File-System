@@ -10,45 +10,48 @@
 #include <fuse.h>
 
 #define MAX_FILENAME_SIZE 256
-#define DIRECTORY_ENTRIES_PER_BLOCK 15
 #define BLOCK_SIZE 4096
 #define UUIDS_PER_BLOCK (BLOCK_SIZE / sizeof(uuid_t))
 
+// Number of block references held in the FCB
 #define NO_DIRECT_BLOCKS 15
 
 #define MAX_FILE_SIZE (BLOCK_SIZE * NO_DIRECT_BLOCKS + BLOCK_SIZE * UUIDS_PER_BLOCK)
 
 const mode_t DEFAULT_FILE_MODE = S_IFREG|S_IRUSR|S_IWUSR|S_IRGRP|S_IWGRP|S_IROTH;
+
 const mode_t DEFAULT_DIR_MODE = S_IFDIR|S_IRUSR|S_IWUSR|S_IXUSR|S_IRGRP|S_IXGRP|S_IROTH|S_IXOTH;
 
 typedef struct _DirectoryEntry {
-    char name[MAX_FILENAME_SIZE];
-    uuid_t fcb_ref;
+    char name[MAX_FILENAME_SIZE]; // The name of the link
+    uuid_t fcb_ref; // The uuid of the FCB the link points to
 } DirectoryEntry;
 
+#define DIRECTORY_ENTRIES_PER_BLOCK (4096 / sizeof(DirectoryEntry))
+
 typedef struct _DirectoryDataBlock {
-    int usedEntries;
-    DirectoryEntry entries[DIRECTORY_ENTRIES_PER_BLOCK];
+    int usedEntries;                                     // The number of used entries in the block. Used for fast traversal of empty or full blocks.
+    DirectoryEntry entries[DIRECTORY_ENTRIES_PER_BLOCK]; // The entries stored
 } DirectoryDataBlock;
 
 typedef struct _FileDataBlock {
-    int size;
-    char data[BLOCK_SIZE];
+    int size;              // How much of the blocks it's being used
+    char data[BLOCK_SIZE]; // The data block
 } FileDataBlock;
 
 typedef struct _FileControlBlock {
-    mode_t          mode;        /* File type and mode */
-    // nlink_t   st_nlink;       /* Number of hard links */ // Maybe implement?
-    uid_t           user_id;         /* User ID of owner */
-    gid_t           group_id;         /* Group ID of owner */
-    off_t           size;        /* Total size, in bytes */
+    mode_t          mode;                           // File type and mode
+    uid_t           user_id;                        // User ID of owner 
+    gid_t           group_id;                       // Group ID of owner 
+    off_t           size;                           // Total size, in bytes 
 
-    uuid_t data_blocks[NO_DIRECT_BLOCKS];
-    uuid_t indirectBlock;
+    uuid_t          data_blocks[NO_DIRECT_BLOCKS];  // Direct references to data blocks
+    
+    uuid_t          indirectBlock;                  // Reference to a list of references to blocks
 
-    struct timespec st_atim;  /* Time of last access */
-    struct timespec st_mtim;  /* Time of last modification */
-    struct timespec st_ctim;  /* Time of last status change */
+    struct timespec st_atim;                        // Time of last access
+    struct timespec st_mtim;                        // Time of last modification
+    struct timespec st_ctim;                        // Time of last status change
 } FileControlBlock;
 
 // We need to use a well-known value as a key for the root object.
@@ -56,7 +59,7 @@ const uuid_t ROOT_OBJECT_KEY = "LongLiveTheKing";
 
 // This is the size of a regular key used to fetch things from the 
 // database. We use uuids as keys, so 16 bytes each
-#define KEY_SIZE 16
+#define KEY_SIZE sizeof(uuid_t)
 
 // The name of the file which will hold our filesystem
 // If things get corrupted, unmount it and delete the file
